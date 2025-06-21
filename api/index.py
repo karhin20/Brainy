@@ -80,8 +80,7 @@ class OrderItem(BaseModel):
     quantity: int = Field(gt=0)
 
 class OrderRequest(BaseModel):
-    user_id: str
-    phone_number: str
+    session_token: str
     items: list[OrderItem]
     total_amount: float = Field(gt=0)
 
@@ -328,11 +327,17 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         return f"Great! Please select the exact items and quantities from this secure link: {selection_url}"
     
     elif intent == "check_status":
-        paid_orders = supabase.table("orders").select("status").eq("user_id", user_id).in_(("status", ["processing", "out-for-delivery"])).order("created_at", desc=True).limit(1).execute().data
-        if paid_orders:
-            return f"I've found your latest order. Its current status is: *{paid_orders[0]['status']}*."
-        else:
-            return "It looks like you don't have any paid orders with us right now. Can I help you start a new one?"
+        try:
+            # More robustly query for the latest paid, active order.
+            paid_orders_res = supabase.table("orders").select("status").eq("user_id", user_id).in_("status", ["processing", "out-for-delivery"]).order("created_at", desc=True).limit(1).execute()
+            
+            if paid_orders_res.data:
+                return f"I've found your latest order. Its current status is: *{paid_orders_res.data[0]['status']}*."
+            else:
+                return "It looks like you don't have any paid orders with us right now. Can I help you start a new one?"
+        except Exception as e:
+            logger.error(f"Error checking order status for user {user_id}: {e}", exc_info=True)
+            return "I'm having trouble looking up your order details right now. Please try again in a moment."
             
     elif intent == "show_order_details":
         # Find the latest order that has been paid for
@@ -398,7 +403,7 @@ async def whatsapp_webhook(request: Request):
             user_id = user['id']
 
             # 2. Check for an existing unpaid order for this user
-            order_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("payment_status", "pending").order("created_at", desc=True).limit(1).execute()
+            order_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("payment_status", "unpaid").order("created_at", desc=True).limit(1).execute()
             order = order_res.data[0] if order_res.data else None
 
             # --- Main Logic Branching ---
@@ -470,37 +475,52 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
     try:
         if not supabase:
             raise HTTPException(status_code=500, detail="Database connection not available")
+        
+        # 1. Look up the session to get user_id and phone_number
+        session_res = supabase.table("sessions").select("user_id, phone_number").eq("session_token", request.session_token).single().execute()
+        
+        if not session_res.data:
+            raise HTTPException(status_code=404, detail="Session not found or expired.")
             
-        # CRITICAL FIX: Invalidate any other pending orders for this user to prevent "zombie" orders.
-        # This ensures a user can only have one active pending order at a time.
-        logger.info(f"Cancelling any existing pending orders for user_id: {request.user_id}")
+        session_data = session_res.data
+        user_id = session_data["user_id"]
+        phone_number = session_data["phone_number"]
+
+        # 2. Invalidate any other pending orders for this user
+        logger.info(f"Cancelling any existing pending orders for user_id: {user_id}")
         supabase.table("orders").update({
             "status": "cancelled",
-            # Consider adding a 'notes' column to your DB for internal tracking.
-            # "notes": "Superseded by a new order." 
-        }).eq("user_id", request.user_id).eq("status", "pending").execute()
+            "payment_status": "cancelled",
+        }).eq("user_id", user_id).eq("payment_status", "unpaid").execute()
 
-
+        # 3. Create the new order
         items_dict = [item.dict() for item in request.items]
 
         order_data = {
-            "user_id": request.user_id,
+            "user_id": user_id,
             "items_json": items_dict,
             "total_amount": request.total_amount,
-            "status": "pending",
+            "status": "pending_confirmation", # Start here to ask about delivery/pickup
             "payment_status": "unpaid",
         }
         
         result = supabase.table("orders").insert(order_data).execute()
 
-        order_id = result.data[0]["id"] if result.data else None
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create new order.")
+
+        order_id = result.data[0]["id"]
         
+        # 4. Invalidate the session token after use
+        supabase.table("sessions").delete().eq("session_token", request.session_token).execute()
+        
+        # 5. Send confirmation message to user via WhatsApp
         delivery_msg = (
-            "Thank you for your order! Please choose your preferred option by replying with the number:\n\n"
+            "Thank you for confirming your items! Please choose your preferred option by replying with the number:\n\n"
             "*1* for Delivery (we'll ask for your location to calculate the fee).\n"
             "*2* for Pickup (no delivery fee)."
         )
-        await send_whatsapp_message(request.phone_number, delivery_msg)
+        await send_whatsapp_message(phone_number, delivery_msg)
         
         return {"status": "order saved", "order_id": order_id}
         
