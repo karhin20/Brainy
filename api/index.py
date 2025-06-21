@@ -215,95 +215,88 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
 @app.post("/whatsapp-webhook")
 async def whatsapp_webhook(request: Request):
     try:
-        # Twilio sends form data, not JSON
         form_data = await request.form()
-        
         raw_from_number = form_data.get("From")
         body = form_data.get("Body", "").strip()
-        
-        # Clean the phone number to remove the 'whatsapp:' prefix
         from_number = raw_from_number.replace("whatsapp:", "") if raw_from_number else None
-        
-        session_token = form_data.get("session") or str(uuid.uuid4())
 
-        # Validate Twilio request
         if not from_number:
             raise HTTPException(status_code=400, detail="Missing From number")
 
-        # Check if this is a delivery type or location response
+        user_id = None
+        user = None
+
         if supabase:
-            user_query = supabase.table("users").select("id").eq("phone_number", from_number).limit(1).execute()
-            if user_query.data:
-                user_id = user_query.data[0]["id"]
-                order_query = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
-                
-                if order_query.data:
-                    order = order_query.data[0]
-                    
-                    # Check if this is a delivery type response
-                    if order.get("delivery_type") is None:
-                        if body.lower() in ["delivery", "pickup"]:
-                            delivery_type = body.lower()
-                            delivery_fee = 0.00 if delivery_type == "pickup" else None
-                            total_with_delivery = order["total_amount"] if delivery_type == "pickup" else None
-                            
-                            # Update order with delivery type
-                            supabase.table("orders").update({
-                                "delivery_type": delivery_type,
-                                "delivery_fee": delivery_fee,
-                                "total_with_delivery": total_with_delivery
-                            }).eq("id", order["id"]).execute()
-                            
-                            if delivery_type == "delivery":
-                                response_message = "Please share your delivery location:"
-                            else:
-                                response_message = "Great! You can pick up your order at our store. Please proceed to payment."
-                        else:
-                            response_message = "Please choose delivery type: 'delivery' or 'pickup'"
-                    else:
-                        # Handle location input for delivery
-                        if order.get("delivery_type") == "delivery" and not order.get("delivery_location"):
-                            delivery_fee = calculate_delivery_fee(body)
-                            total_with_delivery = order["total_amount"] + delivery_fee
-                            
-                            # Update order with location and delivery fee
-                            supabase.table("orders").update({
-                                "delivery_location": body,
-                                "delivery_fee": delivery_fee,
-                                "total_with_delivery": total_with_delivery
-                            }).eq("id", order["id"]).execute()
-                            
-                            payment_link = await generate_paystack_payment_link(order["id"], total_with_delivery, from_number)
-                            response_message = f"Delivery fee: GHS {delivery_fee:.2f}\nTotal: GHS {total_with_delivery:.2f}\n\nPay here: {payment_link}"
-                        else:
-                            response_message = "Your order is being processed. You'll receive updates shortly."
-                else:
-                    # New user or no pending order, use Gemini
-                    intent_data = await call_gemini_intent_extraction(body)
-                    intent = intent_data.get("intent")
-                    products = intent_data.get("products", [])
-
-                    if intent == "buy" and products:
-                        session_token = str(uuid.uuid4())
-                        selection_url = f"{FRONTEND_URL}?session={session_token}"
-                        response_message = f"Great! Please select the items you want from this link: {selection_url}"
-                        if supabase:
-                            supabase.table("sessions").insert({"phone_number": from_number, "session_token": session_token, "last_intent": "buy"}).execute()
-                    else:
-                        response_message = intent_data.get("response", "I'm not sure how to help with that. Could you try rephrasing?")
+            # Step 1: Find or Create the user and get their ID
+            user_res = supabase.table("users").upsert({"phone_number": from_number}, on_conflict="phone_number").execute()
+            if user_res.data:
+                user = user_res.data[0]
+                user_id = user['id']
             else:
-                # Create new user
-                if supabase:
-                    supabase.table("users").insert({"phone_number": from_number}).execute()
-                
-                intent_data = await call_gemini_intent_extraction(body)
-                response_message = intent_data.get("response", "Hello! Welcome to Ghana Fresh Market. What can I get for you today?")
-        else:
-            # Fallback when Supabase is not available
-            response_message = "Welcome to our food market! How can I help you today?"
+                logger.error(f"Could not upsert or find user for phone number: {from_number}")
+                raise HTTPException(status_code=500, detail="User lookup failed")
 
-        # Send WhatsApp response
-        await send_whatsapp_message(from_number, response_message)
+            # Step 2: Check if this user has a pending order to handle delivery/location flow
+            order_query = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
+            
+            if order_query.data:
+                order = order_query.data[0]
+                # Check if this is a delivery type response
+                if order.get("delivery_type") is None:
+                    if body.lower() in ["delivery", "pickup"]:
+                        delivery_type = body.lower()
+                        delivery_fee = 0.00 if delivery_type == "pickup" else None
+                        total_with_delivery = order["total_amount"] if delivery_type == "pickup" else None
+                        
+                        # Update order with delivery type
+                        supabase.table("orders").update({
+                            "delivery_type": delivery_type,
+                            "delivery_fee": delivery_fee,
+                            "total_with_delivery": total_with_delivery
+                        }).eq("id", order["id"]).execute()
+                        
+                        if delivery_type == "delivery":
+                            response_message = "Please share your delivery location:"
+                        else:
+                            response_message = "Great! You can pick up your order at our store. Please proceed to payment."
+                    else:
+                        response_message = "Please choose delivery type: 'delivery' or 'pickup'"
+                elif order.get("delivery_type") == "delivery" and not order.get("delivery_location"):
+                    # Handle location input for delivery
+                    delivery_fee = calculate_delivery_fee(body)
+                    total_with_delivery = order["total_amount"] + delivery_fee
+                    
+                    # Update order with location and delivery fee
+                    supabase.table("orders").update({
+                        "delivery_location": body,
+                        "delivery_fee": delivery_fee,
+                        "total_with_delivery": total_with_delivery
+                    }).eq("id", order["id"]).execute()
+                    
+                    payment_link = await generate_paystack_payment_link(order["id"], total_with_delivery, from_number)
+                    response_message = f"Delivery fee: GHS {delivery_fee:.2f}\nTotal: GHS {total_with_delivery:.2f}\n\nPay here: {payment_link}"
+                else:
+                    response_message = "Your order is being processed. You'll receive updates shortly."
+            else:
+                # Step 3: If no pending order, proceed with Gemini for conversation
+                intent_data = await call_gemini_intent_extraction(body)
+                intent = intent_data.get("intent")
+                
+                if intent == "buy":
+                    products = intent_data.get("products", [])
+                    session_token = str(uuid.uuid4())
+                    selection_url = f"{FRONTEND_URL}?session={session_token}"
+                    response_message = f"Great! Please select the items you want from this link: {selection_url}"
+                    # Create a session LINKED to the user_id
+                    supabase.table("sessions").insert({
+                        "user_id": user_id,
+                        "session_token": session_token,
+                        "last_intent": "buy"
+                    }).execute()
+                else: # greet, ask, etc.
+                    response_message = intent_data.get("response", "I'm not sure how to help. Could you try rephrasing?")
+        
+            await send_whatsapp_message(f"whatsapp:{from_number}", response_message)
         
         return {"status": "success", "message": "Webhook processed successfully"}
         
