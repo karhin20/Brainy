@@ -44,11 +44,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
  
-# Environment variables
+
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://yourdomain.com/select-items")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://marketmenu.vercel.app")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_URL = os.getenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent")
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
