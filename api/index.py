@@ -128,6 +128,7 @@ async def call_gemini_intent_extraction(message: str, user_context: dict) -> dic
             "Here are the possible intents:\n"
             '- **buy**: The user wants to buy one or more items. Extract the items into the "products" list.\n'
             '- **check_status**: The user is asking about their order (e.g., "where is my order?").\n'
+            '- **show_order_details**: User wants to see the items in their current or last order (e.g., "what did I order?", "show my items").\n'
             '- **greet**: The user is just saying hello.\n'
             '- **cancel_order**: The user wants to cancel their current pending order.\n'
             '- **help**: The user is asking for help or is confused.\n'
@@ -135,7 +136,8 @@ async def call_gemini_intent_extraction(message: str, user_context: dict) -> dic
             "Example Scenarios:\n"
             '1. Message: "hi i want to buy yam and onions" -> {"intent": "buy", "products": ["yam", "onions"], "response": "Great! I can help with that."}\n'
             '2. Message: "where is my stuff" -> {"intent": "check_status", "products": [], "response": "Let me check on your order for you."}\n'
-            '3. Message: "hello" -> {"intent": "greet", "products": [], "response": "Hello! Welcome to Ghana Fresh Market. What can I get for you today?"}\n\n'
+            '3. Message: "what was in my last order" -> {"intent": "show_order_details", "products": [], "response": "Let me get the details of your last order."}\n'
+            '4. Message: "hello" -> {"intent": "greet", "products": [], "response": "Hello! Welcome to Ghana Fresh Market. What can I get for you today?"}\n\n'
             "User Message: " + message
         )
 
@@ -247,10 +249,11 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
 
     # Scenario A: Awaiting delivery type choice (and not a cancellation)
     if order.get("delivery_type") is None:
-        if body.lower() == "delivery":
+        clean_body = body.lower().strip()
+        if clean_body == "delivery" or clean_body == "1":
             supabase.table("orders").update({"delivery_type": "delivery"}).eq("id", order_id).execute()
             return "Got it. To calculate the fee, please share your delivery location."
-        elif body.lower() == "pickup":
+        elif clean_body == "pickup" or clean_body == "2":
             total_amount = order["total_amount"]
             try:
                 payment_link = await generate_paystack_payment_link(order_id, total_amount, from_number)
@@ -260,10 +263,14 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
                 logger.error(f"Failed to generate payment link for order {order_id} (pickup).")
                 return "We had a problem generating your payment link. Please try again in a moment or contact support."
         else:
-            return "Please reply with either *Delivery* or *Pickup* to proceed."
+            return "Please reply with *1* for Delivery or *2* for Pickup to proceed."
 
     # Scenario B: Awaiting location for a delivery order (and not a cancellation)
     elif order.get("delivery_type") == "delivery" and order.get("delivery_location") is None:
+        # FIX: If the user just says "delivery" again, don't misinterpret it as a location.
+        if body.lower().strip() == "delivery":
+            return "I understand you've chosen delivery. Please now provide your location so I can calculate the fee."
+
         delivery_fee = calculate_delivery_fee(body, order["total_amount"])
         total_with_delivery = order["total_amount"] + delivery_fee
         try:
@@ -330,6 +337,38 @@ async def handle_new_conversation(user: Dict[str, Any], body: str, from_number: 
         else:
             return "It looks like you don't have any paid orders with us right now. Can I help you start a new one?"
             
+    elif intent == "show_order_details":
+        # Find the latest order that has been paid for
+        latest_order_res = supabase.table("orders").select("items_json, status").eq("user_id", user_id).in_("status", ["processing", "out-for-delivery", "delivered"]).order("created_at", desc=True).limit(1).execute()
+        
+        if not latest_order_res.data:
+            return "I couldn't find any recent completed orders for you. Would you like to start a new one?"
+            
+        latest_order = latest_order_res.data[0]
+        items_json = latest_order.get("items_json", [])
+        
+        if not items_json:
+            return "Your last order seems to have been empty. If you think this is an error, please contact support."
+
+        product_ids = [item['product_id'] for item in items_json]
+        
+        # Fetch product names for the IDs in the order
+        products_res = supabase.table("products").select("id, name").in_("id", product_ids).execute()
+        if not products_res.data:
+             return "I'm having trouble retrieving the item details for your last order. Please contact support."
+
+        product_map = {p['id']: p['name'] for p in products_res.data}
+        
+        item_lines = []
+        for item in items_json:
+            product_name = product_map.get(item['product_id'], "Unknown Item")
+            item_lines.append(f"- {item['quantity']} x {product_name}")
+            
+        items_list_str = "\n".join(item_lines)
+        order_status = latest_order.get('status', 'unknown')
+
+        return f"Here are the items for your most recent order (Status: *{order_status}*):\n\n{items_list_str}"
+
     elif intent == "greet":
         return f"Hello! Welcome back to Ghana Fresh Market. What can I help you with today?"
 
@@ -411,9 +450,9 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(verify_api
         order_id = result.data[0]["id"] if result.data else None
         
         delivery_msg = (
-            "Thank you for your order! Please choose your preferred option:\n\n"
-            "1. Reply with *Delivery* (we'll ask for your location to calculate the fee).\n"
-            "2. Reply with *Pickup* (no delivery fee)."
+            "Thank you for your order! Please choose your preferred option by replying with the number:\n\n"
+            "*1* for Delivery (we'll ask for your location to calculate the fee).\n"
+            "*2* for Pickup (no delivery fee)."
         )
         await send_whatsapp_message(request.phone_number, delivery_msg)
         
