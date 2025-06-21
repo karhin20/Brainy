@@ -111,20 +111,19 @@ async def health_check():
 
 async def call_gemini_intent_extraction(message: str, user_context: dict) -> dict:
     """
-    Call Gemini API to extract intent, products, and a response.
+    Call Gemini API to extract intent and provide a standardized response.
     """
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY not set, using fallback logic.")
         if "cancel" in message.lower(): return {"intent": "cancel_order", "response": "Order cancelled."}
         if "status" in message.lower(): return {"intent": "check_status"}
-        if "buy" in message.lower() or "want" in message.lower(): return {"intent": "buy", "products": []} # Simplified fallback
+        if "buy" in message.lower() or "want" in message.lower(): return {"intent": "buy", "products": []}
         return {"intent": "greet", "response": "Hello! How can I help you today?"}
-    
+
     try:
         headers = {"Content-Type": "application/json"}
         params = {"key": GEMINI_API_KEY}
         
-        # The new, simplified, and more robust prompt
         prompt = (
             f"""
             You are 'Fresh Market GH Assistant', a WhatsApp bot for a grocery service in Ghana.
@@ -153,7 +152,6 @@ async def call_gemini_intent_extraction(message: str, user_context: dict) -> dic
             """
         )
 
-        # Use Gemini's JSON mode for reliable output
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -164,8 +162,6 @@ async def call_gemini_intent_extraction(message: str, user_context: dict) -> dic
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(GEMINI_API_URL, headers=headers, params=params, json=payload)
             response.raise_for_status()
-            
-            # The response is now guaranteed to be JSON, so we can parse it directly
             return response.json()
             
     except httpx.HTTPStatusError as e:
@@ -184,23 +180,23 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
         logger.warning("PAYSTACK_SECRET_KEY not set, using mock payment link")
         return f"https://paystack.com/pay/mock-{order_id}"
     
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-        "Content-Type": "application/json"
-    }
+        headers = {
+            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+            "Content-Type": "application/json"
+        }
     
     # Generate a placeholder email as Paystack requires one.
     placeholder_email = f"{user_phone.replace('+', '')}@market.bot"
 
     payload = {
         "email": placeholder_email,
-        "amount": int(amount * 100),  # Paystack expects amount in kobo
-        "currency": "GHS",
-        "reference": order_id,
-        "callback_url": f"{FRONTEND_URL}/payment-success?order_id={order_id}",
-        "channels": ["card", "mobile_money"],
-        "metadata": {"order_id": order_id, "phone": user_phone}
-    }
+            "amount": int(amount * 100),  # Paystack expects amount in kobo
+            "currency": "GHS",
+            "reference": order_id,
+            "callback_url": f"{FRONTEND_URL}/payment-success?order_id={order_id}",
+            "channels": ["card", "mobile_money"],
+            "metadata": {"order_id": order_id, "phone": user_phone}
+        }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(PAYSTACK_PAYMENT_URL, headers=headers, json=payload)
