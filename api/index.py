@@ -259,7 +259,7 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
 
     # Scenario B: Awaiting location for a delivery order (and not a cancellation)
     elif order.get("delivery_type") == "delivery" and order.get("delivery_location") is None:
-        delivery_fee = calculate_delivery_fee(body)
+        delivery_fee = calculate_delivery_fee(body, order["total_amount"])
         total_with_delivery = order["total_amount"] + delivery_fee
         try:
             payment_link = await generate_paystack_payment_link(order_id, total_with_delivery, from_number)
@@ -273,8 +273,8 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
             
             return f"Thanks! Your delivery fee is ₵{delivery_fee:.2f}, for a total of ₵{total_with_delivery:.2f}. Please pay here to finalize: {payment_link}"
         except Exception:
-            logger.error(f"Failed to generate payment link for order {order_id} (delivery).")
-            return "We had a problem generating your payment link for the delivery. Please try again or contact support."
+            logger.error(f"Delivery status error: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
 
     # Scenario C: User has a pending order (that is ready for payment) but sends a new message
     else:
@@ -381,6 +381,16 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(verify_api
         if not supabase:
             raise HTTPException(status_code=500, detail="Database connection not available")
 
+        # CRITICAL FIX: Invalidate any other pending orders for this user to prevent "zombie" orders.
+        # This ensures a user can only have one active pending order at a time.
+        logger.info(f"Cancelling any existing pending orders for user_id: {request.user_id}")
+        supabase.table("orders").update({
+            "status": "cancelled",
+            # Consider adding a 'notes' column to your DB for internal tracking.
+            # "notes": "Superseded by a new order." 
+        }).eq("user_id", request.user_id).eq("status", "pending").execute()
+
+
         items_dict = [item.dict() for item in request.items]
 
         order_data = {
@@ -470,18 +480,46 @@ async def delivery_status(request: DeliveryStatusUpdate, api_key: str = Depends(
 
 
 
-def calculate_delivery_fee(location: str) -> float:
+def calculate_delivery_fee(location: str, order_total: float) -> float:
     """
-    Calculate delivery fee based on location.
+    Calculates a dynamic delivery fee based on location zones and order total.
+
+    - A base fee is applied to all orders.
+    - A zone-based fee is added based on the delivery location.
+    - Delivery is free for orders over a certain amount to incentivize larger purchases.
     """
-    # Simple delivery fee calculation
+    # 1. Define a base fee for handling and packaging.
     base_fee = 5.00
-    if "accra" in location.lower():
-        return base_fee
-    elif "tema" in location.lower():
-        return base_fee + 2.00
-    else:
-        return base_fee + 3.00
+
+    # 2. Define delivery zones with specific fees.
+    # These can be made more granular over time.
+    zone_fees = {
+        "accra": 5.00,      # e.g., Central Accra
+        "east legon": 7.00,
+        "osu": 7.00,
+        "tema": 10.00,
+        "kasoa": 15.00,
+        "aburi": 20.00,
+    }
+    
+    # Default fee for areas not in a defined zone.
+    location_fee = 25.00 
+
+    # Find the most specific matching zone.
+    location_lower = location.lower()
+    for zone, fee in zone_fees.items():
+        if zone in location_lower:
+            location_fee = fee
+            break  # Use the first zone that matches
+
+    # 3. Check for free delivery threshold.
+    if order_total >= 250:
+        logger.info(f"Order total GHS {order_total:.2f} qualifies for free delivery.")
+        return 0.00
+    
+    # The final fee is the base fee plus the location-specific fee.
+    final_fee = base_fee + location_fee
+    return round(final_fee, 2)
 
 # Export the app for Vercel
 app.debug = False 
