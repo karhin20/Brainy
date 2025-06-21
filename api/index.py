@@ -208,7 +208,12 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
         "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
         "Content-Type": "application/json"
     }
+    
+    # Generate a placeholder email as Paystack requires one.
+    placeholder_email = f"{user_phone.replace('+', '')}@market.bot"
+
     payload = {
+        "email": placeholder_email,
         "amount": int(amount * 100),  # Paystack expects amount in kobo
         "currency": "GHS",
         "reference": order_id,
@@ -272,9 +277,9 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
             }).eq("id", order_id).execute()
             
             return f"Thanks! Your delivery fee is ₵{delivery_fee:.2f}, for a total of ₵{total_with_delivery:.2f}. Please pay here to finalize: {payment_link}"
-        except Exception:
-            logger.error(f"Delivery status error: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            logger.error(f"Failed to generate payment link during delivery step for order {order_id}: {str(e)}", exc_info=True)
+            return "We had a problem generating your payment link for the delivery. Please try again or contact support."
 
     # Scenario C: User has a pending order (that is ready for payment) but sends a new message
     else:
@@ -287,8 +292,8 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
         try:
             payment_link = await generate_paystack_payment_link(order_id, total, from_number)
             return f"It looks like you have an unpaid order with us. To complete it, please use this payment link: {payment_link}\n\nIf you want to cancel it, just reply with *Cancel*."
-        except Exception:
-            logger.error(f"Failed to generate payment link for pending order reminder {order_id}.")
+        except Exception as e:
+            logger.error(f"Failed to generate payment link for pending order reminder {order_id}: {str(e)}", exc_info=True)
             return "It looks like you have an unpaid order with us, but we're having trouble generating the payment link right now. Please try again in a bit, or reply *Cancel* to start over."
 
 async def handle_new_conversation(user: Dict[str, Any], body: str, from_number: str) -> str:
@@ -432,23 +437,42 @@ async def payment_success(request: Request, api_key: str = Depends(verify_api_ke
             raise HTTPException(status_code=500, detail="Database connection not available")
         
         # Update order status
-        supabase.table("orders").update({
-            "status": "paid",
+        update_res = supabase.table("orders").update({
+            "payment_status": "paid",
+            "status": "processing", # Set status to processing upon successful payment
             "payment_confirmed_at": datetime.now().isoformat()
         }).eq("id", order_id).execute()
         
-        # Get order details for notification
-        order_query = supabase.table("orders").select("*").eq("id", order_id).execute()
-        if order_query.data:
-            order = order_query.data[0]
-            notification_message = f"Payment confirmed for order {order_id}. Your order is being prepared!"
-            await send_whatsapp_message(order["phone_number"], notification_message)
+        if not update_res.data:
+            logger.warning(f"Payment success hook: No order found for order_id {order_id} to update.")
+            # Even if the order isn't found, we should return a success to Paystack to prevent retries.
+            return {"status": "success", "message": "Order not found, but acknowledged."}
+
+
+        # Get user phone number for notification
+        order = update_res.data[0]
+        user_query = supabase.table("users").select("phone_number").eq("id", order["user_id"]).execute()
         
-        return {"status": "success", "message": "Payment confirmed"}
+        if user_query.data:
+            phone_number = user_query.data[0]["phone_number"]
+            notification_message = (
+                f"✅ Payment confirmed for your order!\n\n"
+                f"Your Order ID is: {order_id}.\n"
+                "We are now preparing your items for delivery. We'll let you know once it's on its way."
+            )
+            await send_whatsapp_message(phone_number, notification_message)
+        else:
+            logger.error(f"Could not find user to notify for paid order {order_id}")
+        
+        return {"status": "success", "message": "Payment confirmed and user notified"}
         
     except Exception as e:
-        logger.error(f"Payment success error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Payment success webhook error: {str(e)}", exc_info=True)
+        # It's crucial to return a success-like status to Paystack to prevent repeated webhook calls.
+        return JSONResponse(
+            status_code=200,
+            content={"status": "error", "message": "Webhook processed with an internal error."}
+        )
     
 
 
@@ -460,18 +484,25 @@ async def delivery_status(request: DeliveryStatusUpdate, api_key: str = Depends(
             raise HTTPException(status_code=500, detail="Database connection not available")
         
         # Update order status
-        supabase.table("orders").update({
+        update_res = supabase.table("orders").update({
             "status": request.status,
             "updated_at": datetime.now().isoformat()
         }).eq("id", request.order_id).execute()
-        
-        # Get order details for notification
-        order_query = supabase.table("orders").select("*").eq("id", request.order_id).execute()
-        if order_query.data:
-            order = order_query.data[0]
-            status_message = f"Order {request.order_id} status: {request.status}"
-            await send_whatsapp_message(order["phone_number"], status_message)
-        
+
+        if not update_res.data:
+            raise HTTPException(status_code=404, detail=f"Order with ID {request.order_id} not found.")
+
+        # Get user phone number for notification
+        order = update_res.data[0]
+        user_query = supabase.table("users").select("phone_number").eq("id", order["user_id"]).execute()
+
+        if user_query.data:
+            phone_number = user_query.data[0]["phone_number"]
+            status_message = f"Good news! Your order ({request.order_id}) is now *{request.status}*."
+            await send_whatsapp_message(phone_number, status_message)
+        else:
+            logger.error(f"Could not find user to notify for delivery status update on order {request.order_id}")
+
         return {"status": "success", "message": f"Order status updated to {request.status}"}
         
     except Exception as e:
