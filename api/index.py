@@ -123,11 +123,26 @@ async def call_gemini_intent_extraction(message: str) -> dict:
             response = await client.post(GEMINI_API_URL, headers=headers, params=params, json=payload)
             response.raise_for_status()
             result = response.json()
+            
+            # More robust JSON extraction
             text = result["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
+            try:
+                # The AI might return the JSON inside a markdown code block.
+                # Find the start and end of the JSON.
+                json_start_index = text.find('{')
+                json_end_index = text.rfind('}') + 1
+                if json_start_index != -1 and json_end_index != -1:
+                    json_str = text[json_start_index:json_end_index]
+                    return json.loads(json_str)
+                else:
+                    raise json.JSONDecodeError("No JSON object found", text, 0)
+            except json.JSONDecodeError:
+                logger.error(f"Failed to decode JSON from Gemini response: {text}")
+                # Fallback if JSON is malformed or not found
+                return {"intent": "ask", "products": [], "response": text}
     except Exception as e:
         logger.error(f"Gemini API error: {str(e)}", exc_info=True)
-        return {"intent": "buy", "products": ["tomatoes", "onions"] if "tomato" in message.lower() or "onion" in message.lower() else []}
+        return {"intent": "error", "products": [], "response": "Sorry, I had a problem understanding that."}
 
 async def send_whatsapp_message(to_number: str, message: str) -> dict:
     """
@@ -153,6 +168,11 @@ async def send_whatsapp_message(to_number: str, message: str) -> dict:
             response = await client.post(url, data=data, auth=auth)
             response.raise_for_status()
             return response.json()
+    except httpx.HTTPStatusError as e:
+        # Log the detailed error response from Twilio
+        error_response = e.response.json()
+        logger.error(f"Twilio API error: {str(e)} - Response: {error_response}", exc_info=True)
+        return {"error": str(e), "details": error_response}
     except Exception as e:
         logger.error(f"Twilio API error: {str(e)}", exc_info=True)
         return {"error": str(e)}
@@ -255,7 +275,22 @@ async def whatsapp_webhook(request: Request):
                 else:
                     # New user or no pending order
                     intent_data = await call_gemini_intent_extraction(body)
-                    response_message = f"Welcome! I detected you want to {intent_data['intent']}. Available products: {', '.join(intent_data['products'])}"
+                    intent = intent_data.get("intent")
+                    products = intent_data.get("products", [])
+                    
+                    # Determine the reply message based on intent
+                    if intent == "buy" and products:
+                        session_token = str(uuid.uuid4())
+                        selection_url = f"{FRONTEND_URL}?session={session_token}"
+                        response_message = f"You want to buy: {', '.join(products)}. Please select your items here: {selection_url}"
+                        # Create a session for the user
+                        supabase.table("sessions").insert({
+                            "phone_number": from_number,
+                            "session_token": session_token,
+                            "last_intent": "buy"
+                        }).execute()
+                    else:
+                        response_message = intent_data.get("response", "I'm not sure how to help with that. Could you try rephrasing?")
             else:
                 # Create new user
                 new_user = supabase.table("users").insert({
@@ -263,7 +298,22 @@ async def whatsapp_webhook(request: Request):
                 }).execute()
                 
                 intent_data = await call_gemini_intent_extraction(body)
-                response_message = f"Welcome! I detected you want to {intent_data['intent']}. Available products: {', '.join(intent_data['products'])}"
+                intent = intent_data.get("intent")
+                products = intent_data.get("products", [])
+                
+                # Determine the reply message based on intent
+                if intent == "buy" and products:
+                    session_token = str(uuid.uuid4())
+                    selection_url = f"{FRONTEND_URL}?session={session_token}"
+                    response_message = f"You want to buy: {', '.join(products)}. Please select your items here: {selection_url}"
+                    # Create a session for the user
+                    supabase.table("sessions").insert({
+                        "phone_number": from_number,
+                        "session_token": session_token,
+                        "last_intent": "buy"
+                    }).execute()
+                else:
+                    response_message = intent_data.get("response", "I'm not sure how to help with that. Could you try rephrasing?")
         else:
             # Fallback when Supabase is not available
             response_message = "Welcome to our food market! How can I help you today?"
