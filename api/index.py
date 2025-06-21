@@ -198,79 +198,98 @@ async def send_whatsapp_message(to_number: str, message: str) -> dict:
 async def generate_paystack_payment_link(order_id: str, amount: float, user_phone: str) -> str:
     """
     Generate a Paystack payment link for the order.
+    Raises an exception if the API call fails.
     """
     if not PAYSTACK_SECRET_KEY:
         logger.warning("PAYSTACK_SECRET_KEY not set, using mock payment link")
         return f"https://paystack.com/pay/mock-{order_id}"
     
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "amount": int(amount * 100),  # Paystack expects amount in kobo
+        "currency": "GHS",
+        "reference": order_id,
+        "callback_url": f"{FRONTEND_URL}/payment-success?order_id={order_id}",
+        "channels": ["card", "mobile_money"],
+        "metadata": {"order_id": order_id, "phone": user_phone}
+    }
     try:
-        headers = {
-            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "amount": int(amount * 100),  # Paystack expects amount in kobo
-            "currency": "GHS",
-            "reference": order_id,
-            "callback_url": f"{FRONTEND_URL}/payment-success?order_id={order_id}",
-            "channels": ["card", "mobile_money"],
-            "metadata": {"order_id": order_id, "phone": user_phone}
-        }
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(PAYSTACK_PAYMENT_URL, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
             return data["data"]["authorization_url"]
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Paystack API HTTPStatusError: {str(e)} - Response: {e.response.text}", exc_info=True)
+        # Re-raise the exception to be handled by the calling function
+        raise
     except Exception as e:
-        logger.error(f"Paystack API error: {str(e)}", exc_info=True)
-        return f"https://paystack.com/pay/mock-{order_id}"
+        logger.error(f"Paystack API general error: {str(e)}", exc_info=True)
+        # Re-raise for the calling function to handle
+        raise
 
 async def handle_pending_order(order: Dict[str, Any], body: str, from_number: str) -> str:
     """Handles interaction when a user already has an order with 'pending' status."""
     order_id = order["id"]
-    
-    # Scenario A: Awaiting delivery type choice
+
+    # Always check for cancellation first, regardless of the order's state.
+    if body.lower() in ['cancel', 'cancel order']:
+        supabase.table("orders").update({"status": "cancelled"}).eq("id", order_id).execute()
+        return "Your pending order has been cancelled. You can start a new one anytime."
+
+    # Scenario A: Awaiting delivery type choice (and not a cancellation)
     if order.get("delivery_type") is None:
         if body.lower() == "delivery":
             supabase.table("orders").update({"delivery_type": "delivery"}).eq("id", order_id).execute()
-            return "Got it. Please share your delivery location so we can calculate the fee."
+            return "Got it. To calculate the fee, please share your delivery location."
         elif body.lower() == "pickup":
             total_amount = order["total_amount"]
-            payment_link = await generate_paystack_payment_link(order_id, total_amount, from_number)
-            supabase.table("orders").update({"delivery_type": "pickup", "delivery_fee": 0, "total_with_delivery": total_amount}).eq("id", order_id).execute()
-            return f"Pickup selected. Your total is ₵{total_amount:.2f}. Please pay here to complete your order: {payment_link}"
+            try:
+                payment_link = await generate_paystack_payment_link(order_id, total_amount, from_number)
+                supabase.table("orders").update({"delivery_type": "pickup", "delivery_fee": 0, "total_with_delivery": total_amount}).eq("id", order_id).execute()
+                return f"Pickup selected. Your total is ₵{total_amount:.2f}. Please pay here: {payment_link}"
+            except Exception:
+                logger.error(f"Failed to generate payment link for order {order_id} (pickup).")
+                return "We had a problem generating your payment link. Please try again in a moment or contact support."
         else:
             return "Please reply with either *Delivery* or *Pickup* to proceed."
 
-    # Scenario B: Awaiting location for a delivery order
+    # Scenario B: Awaiting location for a delivery order (and not a cancellation)
     elif order.get("delivery_type") == "delivery" and order.get("delivery_location") is None:
         delivery_fee = calculate_delivery_fee(body)
         total_with_delivery = order["total_amount"] + delivery_fee
-        payment_link = await generate_paystack_payment_link(order_id, total_with_delivery, from_number)
-        
-        supabase.table("orders").update({
-            "delivery_location": body,
-            "location_updated_at": datetime.utcnow().isoformat(),
-            "delivery_fee": delivery_fee,
-            "total_with_delivery": total_with_delivery
-        }).eq("id", order_id).execute()
-        
-        return f"Thanks! Your delivery fee is ₵{delivery_fee:.2f}, bringing your total to ₵{total_with_delivery:.2f}. Please pay here to finalize: {payment_link}"
+        try:
+            payment_link = await generate_paystack_payment_link(order_id, total_with_delivery, from_number)
+            
+            supabase.table("orders").update({
+                "delivery_location": body,
+                "location_updated_at": datetime.utcnow().isoformat(),
+                "delivery_fee": delivery_fee,
+                "total_with_delivery": total_with_delivery
+            }).eq("id", order_id).execute()
+            
+            return f"Thanks! Your delivery fee is ₵{delivery_fee:.2f}, for a total of ₵{total_with_delivery:.2f}. Please pay here to finalize: {payment_link}"
+        except Exception:
+            logger.error(f"Failed to generate payment link for order {order_id} (delivery).")
+            return "We had a problem generating your payment link for the delivery. Please try again or contact support."
 
-    # Scenario C: User has a pending order but sends a new message
+    # Scenario C: User has a pending order (that is ready for payment) but sends a new message
     else:
-        if body.lower() in ['cancel', 'cancel order']:
-            supabase.table("orders").update({"status": "cancelled"}).eq("id", order_id).execute()
-            return "Your pending order has been cancelled. Feel free to start a new one!"
-        
         # If user tries to buy something new while having a pending order
         intent_data = await call_gemini_intent_extraction(body, {})
         if intent_data.get('intent') == 'buy':
-            return "You already have a pending order. To make changes, please reply with *Cancel* to cancel the current one first, then you can start a new order."
+            return "You already have a pending order. To make changes, please reply with *Cancel* to cancel it first, then you can start a new one."
 
         total = order.get("total_with_delivery") or order.get("total_amount")
-        payment_link = await generate_paystack_payment_link(order_id, total, from_number)
-        return f"It looks like you have an unpaid order with us. To complete it, please use this payment link: {payment_link}\n\nIf you want to cancel it, just reply with *Cancel*."
+        try:
+            payment_link = await generate_paystack_payment_link(order_id, total, from_number)
+            return f"It looks like you have an unpaid order with us. To complete it, please use this payment link: {payment_link}\n\nIf you want to cancel it, just reply with *Cancel*."
+        except Exception:
+            logger.error(f"Failed to generate payment link for pending order reminder {order_id}.")
+            return "It looks like you have an unpaid order with us, but we're having trouble generating the payment link right now. Please try again in a bit, or reply *Cancel* to start over."
 
 async def handle_new_conversation(user: Dict[str, Any], body: str, from_number: str) -> str:
     """Handles interaction when a user has no pending orders."""
