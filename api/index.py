@@ -186,10 +186,12 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
 @app.post("/whatsapp-webhook")
 async def whatsapp_webhook(request: Request):
     try:
-        data = await request.json()
-        from_number = data.get("From")
-        body = data.get("Body", "").strip()
-        session_token = data.get("session") or str(uuid.uuid4())
+        # Twilio sends form data, not JSON
+        form_data = await request.form()
+        
+        from_number = form_data.get("From")
+        body = form_data.get("Body", "").strip()
+        session_token = form_data.get("session") or str(uuid.uuid4())
 
         # Validate Twilio request
         if not from_number:
