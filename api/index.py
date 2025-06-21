@@ -113,8 +113,13 @@ async def call_gemini_intent_extraction(message: str) -> dict:
         headers = {"Content-Type": "application/json"}
         params = {"key": GEMINI_API_KEY}
         prompt = (
-            "Extract the user's intent (e.g., buy, ask, greet) and a list of food products mentioned from this message. "
-            "Respond as JSON: {\"intent\": string, \"products\": string[]}\nMessage: " + message
+            'You are a friendly and helpful assistant for "Ghana Fresh Market", a WhatsApp-based grocery store. '
+            'Your goal is to help users buy food items. '
+            "From the user's message, extract their intent and any food items they mentioned. "
+            '- If the intent is to buy or they list items, respond with {"intent": "buy", "products": ["item1", "item2"]}. '
+            '- If the user is just greeting (e.g., "hello", "hi"), respond with {"intent": "greet", "response": "Hello! Welcome to Ghana Fresh Market. What would you like to buy today?"}. '
+            '- For any other query, provide a helpful answer and gently guide them back to shopping. Format this as {"intent": "ask", "response": "Your helpful answer..."}. '
+            "Message: " + message
         )
         payload = {
             "contents": [{"parts": [{"text": prompt}]}]
@@ -273,47 +278,26 @@ async def whatsapp_webhook(request: Request):
                         else:
                             response_message = "Your order is being processed. You'll receive updates shortly."
                 else:
-                    # New user or no pending order
+                    # New user or no pending order, use Gemini
                     intent_data = await call_gemini_intent_extraction(body)
                     intent = intent_data.get("intent")
                     products = intent_data.get("products", [])
-                    
-                    # Determine the reply message based on intent
+
                     if intent == "buy" and products:
                         session_token = str(uuid.uuid4())
                         selection_url = f"{FRONTEND_URL}?session={session_token}"
-                        response_message = f"You want to buy: {', '.join(products)}. Please select your items here: {selection_url}"
-                        # Create a session for the user
-                        supabase.table("sessions").insert({
-                            "phone_number": from_number,
-                            "session_token": session_token,
-                            "last_intent": "buy"
-                        }).execute()
+                        response_message = f"Great! Please select the items you want from this link: {selection_url}"
+                        if supabase:
+                            supabase.table("sessions").insert({"phone_number": from_number, "session_token": session_token, "last_intent": "buy"}).execute()
                     else:
                         response_message = intent_data.get("response", "I'm not sure how to help with that. Could you try rephrasing?")
             else:
                 # Create new user
-                new_user = supabase.table("users").insert({
-                    "phone_number": from_number
-                }).execute()
+                if supabase:
+                    supabase.table("users").insert({"phone_number": from_number}).execute()
                 
                 intent_data = await call_gemini_intent_extraction(body)
-                intent = intent_data.get("intent")
-                products = intent_data.get("products", [])
-                
-                # Determine the reply message based on intent
-                if intent == "buy" and products:
-                    session_token = str(uuid.uuid4())
-                    selection_url = f"{FRONTEND_URL}?session={session_token}"
-                    response_message = f"You want to buy: {', '.join(products)}. Please select your items here: {selection_url}"
-                    # Create a session for the user
-                    supabase.table("sessions").insert({
-                        "phone_number": from_number,
-                        "session_token": session_token,
-                        "last_intent": "buy"
-                    }).execute()
-                else:
-                    response_message = intent_data.get("response", "I'm not sure how to help with that. Could you try rephrasing?")
+                response_message = intent_data.get("response", "Hello! Welcome to Ghana Fresh Market. What can I get for you today?")
         else:
             # Fallback when Supabase is not available
             response_message = "Welcome to our food market! How can I help you today?"
@@ -332,30 +316,33 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(verify_api
     try:
         if not supabase:
             raise HTTPException(status_code=500, detail="Database connection not available")
-            
-        order_id = str(uuid.uuid4())
-        
-        # Create order in database
+
+        items_dict = [item.dict() for item in request.items]
+
         order_data = {
-            "id": order_id,
             "user_id": request.user_id,
-            "phone_number": request.phone_number,
-            "items": request.items,
+            "items_json": items_dict,
             "total_amount": request.total_amount,
             "status": "pending",
-            "created_at": datetime.now().isoformat()
+            "payment_status": "unpaid",
         }
         
-        supabase.table("orders").insert(order_data).execute()
+        result = supabase.table("orders").insert(order_data).execute()
+
+        if result.error:
+            logger.error(f"Supabase error inserting order: {result.error}")
+            raise HTTPException(status_code=500, detail=str(result.error))
+
+        order_id = result.data[0]["id"] if result.data else None
         
-        # Generate payment link
-        payment_link = await generate_paystack_payment_link(order_id, request.total_amount, request.phone_number)
+        delivery_msg = (
+            "Thank you for your order! Please choose your preferred option:\n\n"
+            "1. Reply with *Delivery* (we'll ask for your location to calculate the fee).\n"
+            "2. Reply with *Pickup* (no delivery fee)."
+        )
+        await send_whatsapp_message(request.phone_number, delivery_msg)
         
-        return {
-            "order_id": order_id,
-            "payment_link": payment_link,
-            "status": "pending"
-        }
+        return {"status": "order saved", "order_id": order_id}
         
     except Exception as e:
         logger.error(f"Confirm items error: {str(e)}", exc_info=True)
