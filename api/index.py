@@ -290,6 +290,7 @@ async def whatsapp_webhook(request: Request):
                     # Create a session LINKED to the user_id
                     supabase.table("sessions").insert({
                         "user_id": user_id,
+                        "phone_number": from_number,
                         "session_token": session_token,
                         "last_intent": "buy"
                     }).execute()
