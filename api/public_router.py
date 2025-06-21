@@ -12,17 +12,23 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 
-@router.get("/products")
+@router.get("/public/products", tags=["Public"])
 async def get_public_products():
     """
-    A public endpoint to fetch all available (in-stock) products
-    for the shareable menu.
+    Public endpoint to fetch all available products.
+    No authentication required.
     """
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Database connection not available")
     try:
-        # Only fetch products that are marked as available_stock = true
-        response = supabase.table("products").select("*").eq("available_stock", True).order("name").execute()
+        if not supabase:
+            raise HTTPException(status_code=503, detail="Database connection not available")
+        
+        # Correctly filter for items where stock is greater than 0
+        response = supabase.table("products").select("*").gt("available_stock", 0).order("name").execute()
+        
+        if not response.data:
+            logger.warning("No public products found or database query failed.")
+            return []
+
         return response.data
     except Exception as e:
         logger.error(f"Could not fetch public products: {e}", exc_info=True)
