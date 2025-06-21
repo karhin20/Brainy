@@ -1,4 +1,4 @@
-.env
+/.env
 .env.example
 /sharable-menu-83
 .cursor
