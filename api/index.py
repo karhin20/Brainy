@@ -267,8 +267,10 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
 
     # Scenario B: Awaiting location for a delivery order (and not a cancellation)
     elif order.get("delivery_type") == "delivery" and order.get("delivery_location") is None:
-        # FIX: If the user just says "delivery" again, don't misinterpret it as a location.
-        if body.lower().strip() == "delivery":
+        clean_body = body.lower().strip()
+        # FIX: If the user just says "delivery" or "1" again, which might happen on a retry,
+        # don't misinterpret it as a location. Instead, re-prompt for the location.
+        if clean_body == "delivery" or clean_body == "1":
             return "I understand you've chosen delivery. Please now provide your location so I can calculate the fee."
 
         delivery_fee = calculate_delivery_fee(body, order["total_amount"])
