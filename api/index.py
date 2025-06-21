@@ -113,11 +113,11 @@ async def call_gemini_intent_extraction(message: str) -> dict:
         headers = {"Content-Type": "application/json"}
         params = {"key": GEMINI_API_KEY}
         prompt = (
-            'You are a friendly and helpful assistant for "Ghana Fresh Market", a WhatsApp-based grocery store. '
+            'You are a friendly and helpful assistant for "Fresh Market GH", a WhatsApp-based grocery store. '
             'Your goal is to help users buy food items. '
             "From the user's message, extract their intent and any food items they mentioned. "
             '- If the intent is to buy or they list items, respond with {"intent": "buy", "products": ["item1", "item2"]}. '
-            '- If the user is just greeting (e.g., "hello", "hi"), respond with {"intent": "greet", "response": "Hello! Welcome to Ghana Fresh Market. What would you like to buy today?"}. '
+            '- If the user is just greeting (e.g., "hello", "hi"), respond with {"intent": "greet", "response": "Hello! Welcome to Fresh Market GH. What would you like to buy today?"}. '
             '- For any other query, provide a helpful answer and gently guide them back to shopping. Format this as {"intent": "ask", "response": "Your helpful answer..."}. '
             "Message: " + message
         )
