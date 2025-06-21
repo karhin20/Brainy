@@ -251,8 +251,7 @@ async def whatsapp_webhook(request: Request):
             else:
                 # Create new user
                 new_user = supabase.table("users").insert({
-                    "phone_number": from_number,
-                    "session_token": session_token
+                    "phone_number": from_number
                 }).execute()
                 
                 intent_data = await call_gemini_intent_extraction(body)
