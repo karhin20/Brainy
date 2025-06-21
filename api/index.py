@@ -304,19 +304,14 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     """Handles interaction when a user has no pending orders."""
     user_id = user['id']
 
-    # Context for Gemini
-    user_context = {
-        "name": user.get("name"),
-        "has_paid_order": bool(supabase.table("orders").select("id").eq("user_id", user_id).in_("status", ["processing", "out-for-delivery"]).limit(1).execute().data)
-    }
-
-    intent_data = await call_gemini_intent_extraction(gemini_result, user_context)
+    # The intent has already been determined, so we just use the result.
+    # No need to call the AI again.
+    intent_data = gemini_result
     intent = intent_data.get("intent")
 
     if intent == "buy":
-        products = intent_data.get("products", [])
-        if not products:
-            return "It sounds like you want to buy something, but I couldn't catch what items. Could you please list them?"
+        # The AI doesn't extract products anymore in the new prompt, so we remove it.
+        # The menu link is always sent for the 'buy' intent.
         session_token = str(uuid.uuid4())
         selection_url = f"{FRONTEND_URL}?session={session_token}"
         supabase.table("sessions").insert({
@@ -328,7 +323,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         return f"Great! Please select the exact items and quantities from this secure link: {selection_url}"
     
     elif intent == "check_status":
-        paid_orders = supabase.table("orders").select("status").eq("user_id", user_id).in_("status", ["processing", "out-for-delivery"]).order("created_at", desc=True).limit(1).execute().data
+        paid_orders = supabase.table("orders").select("status").eq("user_id", user_id).in_(("status", ["processing", "out-for-delivery"])).order("created_at", desc=True).limit(1).execute().data
         if paid_orders:
             return f"I've found your latest order. Its current status is: *{paid_orders[0]['status']}*."
         else:
