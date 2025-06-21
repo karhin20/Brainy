@@ -323,10 +323,6 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(verify_api
         
         result = supabase.table("orders").insert(order_data).execute()
 
-        if result.error:
-            logger.error(f"Supabase error inserting order: {result.error}")
-            raise HTTPException(status_code=500, detail=str(result.error))
-
         order_id = result.data[0]["id"] if result.data else None
         
         delivery_msg = (
