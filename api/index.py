@@ -114,146 +114,66 @@ async def call_gemini_intent_extraction(message: str, user_context: dict) -> dic
     Call Gemini API to extract intent, products, and a response.
     """
     if not GEMINI_API_KEY:
-        # Fallback for development if Gemini key is not set
-        if "order" in message: return {"intent": "check_status"}
-        if "buy" in message: return {"intent": "buy", "products": ["yam"]}
-        return {"intent": "greet", "response": "Hello! Welcome back to Fresh Market GH."}
+        logger.warning("GEMINI_API_KEY not set, using fallback logic.")
+        if "cancel" in message.lower(): return {"intent": "cancel_order", "response": "Order cancelled."}
+        if "status" in message.lower(): return {"intent": "check_status"}
+        if "buy" in message.lower() or "want" in message.lower(): return {"intent": "buy", "products": []} # Simplified fallback
+        return {"intent": "greet", "response": "Hello! How can I help you today?"}
     
     try:
         headers = {"Content-Type": "application/json"}
         params = {"key": GEMINI_API_KEY}
         
-        # Build a more context-aware prompt
-        prompt_context = f"The user's name is {user_context.get('name', 'a returning customer')}."
-        if user_context.get('has_paid_order'):
-            prompt_context += " They have a paid order that is currently being processed."
-
+        # The new, simplified, and more robust prompt
         prompt = (
             f"""
-            You are 'Fresh Market GH Assistant', a friendly, helpful, and efficient virtual assistant for our WhatsApp-based grocery service in Ghana.
+            You are 'Fresh Market GH Assistant', a WhatsApp bot for a grocery service in Ghana.
+            Your ONLY job is to understand a user's request and classify it into a specific intent.
+            You MUST ONLY respond with a single, minified JSON object. Do not include any other text or markdown.
 
-            Your primary goals are:
-            1. To assist users with placing orders for fresh food items.
-            2. To provide information about their existing or past orders.
-            3. To guide users through the service.
+            The user's message is: "{message}"
 
-            You will receive the user's message and potentially additional context ('{prompt_context}') about the current state (e.g., active order, user history) to help you understand the user's request accurately.
+            Based on the message, determine the user's intent. Here are the possible intents:
+            - `buy`: The user wants to purchase groceries.
+            - `check_status`: The user is asking about an existing order's status.
+            - `cancel_order`: The user wants to cancel a pending order.
+            - `greet`: The user is saying hello.
+            - `help`: The user needs help using the service.
+            - `unknown`: The intent is unclear, irrelevant to groceries (e.g., asking for money, telling a joke), or abusive.
 
-            Your task is to analyze the user's message and the provided context to determine the user's primary intent and extract any relevant information (specifically food items).
-
-            You MUST respond in PURE JSON format containing ONLY the following three fields:
-            -   `intent` (string): The user's primary goal.
-            -   `products` (list of strings): A list of specific food items mentioned by the user, particularly for the 'buy' intent. Extract item names as clearly as possible (e.g., "red onions", "ripe plantain"). This list should be empty `[]` if no specific items are mentioned or the intent is not 'buy'.
-            -   `response` (string): A short, friendly conversational acknowledgement of the user's request based on the determined intent. This is *not* the final full response, but a brief confirmation that you understood the request. Keep this brief and relevant.
-
-            Here are the possible intents and their descriptions:
-
-            -   **`buy`**: The user wants to purchase one or more food items. Extract all mentioned food items into the `products` list.
-            -   **`check_status`**: The user is asking about the status or location of their current or last order (e.g., "Where is my order?", "Is my delivery coming soon?").
-            -   **`show_order_details`**: The user wants to see the items or details of their current or last order (e.g., "What did I order?", "Show me my items", "Can I see my last order?").
-            -   **`greet`**: The user is initiating contact with a simple greeting (e.g., "hello", "hi", "good morning").
-            -   **`cancel_order`**: The user wants to stop or cancel their pending order (e.g., "Cancel my order", "I want to stop my purchase").
-            -   **`help`**: The user is asking for instructions, guidance, or expressing confusion about how to use the service or place an order.
-            -   **`ask`**: The user is asking a general question related to the service or products, not covered by other intents (e.g., "Do you sell kontomire?", "What are your opening hours?", "How much is a tuber of yam?").
-            -   **`unknown`**: The user message is unclear, irrelevant, or does not match any of the defined intents.
-
-            If the user's message is unclear or doesn't fit any defined intent, use the 'unknown' intent.
-
-            Maintain a friendly, helpful, and approachable tone in the 'response' field.
-
-            Example Scenarios:
-
-            1.  Message: "hi i want to buy some yam and green pepper please"
-                Output: ```json
-                {{
-                "intent": "buy",
-                "products": ["yam", "green pepper"],
-                "response": "Okay, I can help you with that!"
-                }}
-                ```
-            2.  Message: "where is my delivery?"
-                Output: ```json
-                {{
-                "intent": "check_status",
-                "products": [],
-                "response": "Let me check the status of your order."
-                }}
-                ```
-            3.  Message: "what was in my last order?"
-                Output: ```json
-                {{
-                "intent": "show_order_details",
-                "products": [],
-                "response": "Getting the details of your last order now."
-                }}
-                ```
-            4.  Message: "Hello there"
-                Output: ```json
-                {{
-                "intent": "greet",
-                "products": [],
-                "response": "Hello! Welcome to Fresh Market GH."
-                }}
-                ```
-            5.  Message: "Can I cancel my order from this morning?"
-                Output: ```json
-                {{
-                "intent": "cancel_order",
-                "products": [],
-                "response": "Okay, I can assist with cancelling your order."
-                }}
-                ```
-            6.  Message: "How do I place an order?"
-                Output: ```json
-                {{
-                "intent": "help",
-                "products": [],
-                "response": "I can explain how to place an order."
-                }}
-                ```
-            7.  Message: "Do you have fresh fish today?"
-                Output: ```json
-                {{
-                "intent": "ask",
-                "products": [],
-                "response": "Let me check our availability."
-                }}
-                ```
-            8.  Message: "Tell me a joke"
-                Output: ```json
-                {{
-                "intent": "unknown",
-                "products": [],
-                "response": "I'm sorry, I can only help with your grocery needs."
-                }}
-                ```
-
-            User Message: {message}
+            Your JSON output MUST contain these fields:
+            - `intent` (string): One of the intents from the list above.
+            - `response` (string): A short, friendly acknowledgement.
+                - For `buy`: "Great! I can help with that."
+                - For `check_status`: "Let me check on your order."
+                - For `cancel_order`: "I can help with cancelling your order."
+                - For `greet`: "Hello! How can I help you with your groceries today?"
+                - For `help`: "I can certainly help with that."
+                - For `unknown`: "I'm sorry, I can only assist with grocery orders."
             """
         )
 
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        # Use Gemini's JSON mode for reliable output
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "response_mime_type": "application/json",
+            }
+        }
         
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(GEMINI_API_URL, headers=headers, params=params, json=payload)
             response.raise_for_status()
-            result = response.json()
             
-            text = result["candidates"][0]["content"]["parts"][0]["text"]
-            try:
-                json_start_index = text.find('{')
-                json_end_index = text.rfind('}') + 1
-                if json_start_index != -1 and json_end_index != -1:
-                    json_str = text[json_start_index:json_end_index]
-                    return json.loads(json_str)
-                else:
-                    raise json.JSONDecodeError("No JSON object found", text, 0)
-            except json.JSONDecodeError:
-                logger.error(f"Failed to decode JSON from Gemini response: {text}")
-                return {"intent": "ask", "products": [], "response": text} # Return the raw text if parsing fails
+            # The response is now guaranteed to be JSON, so we can parse it directly
+            return response.json()
+            
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Gemini API HTTP Error: {e.response.text}", exc_info=True)
+        return {"intent": "unknown", "response": "I'm having a little trouble connecting. Please try again in a moment."}
     except Exception as e:
-        logger.error(f"Gemini API error: {str(e)}", exc_info=True)
-        return {"intent": "error", "products": [], "response": "Sorry, I'm having a little trouble understanding. Could you try rephrasing?"}
+        logger.error(f"Error in call_gemini_intent_extraction: {e}", exc_info=True)
+        return {"intent": "unknown", "response": "I'm sorry, something went wrong on my end. Please try again."}
 
 async def generate_paystack_payment_link(order_id: str, amount: float, user_phone: str) -> str:
     """
@@ -509,7 +429,7 @@ async def whatsapp_webhook(request: Request):
                     # Update order with delivery details
                     update_data = {
                         "status": "pending_payment",
-                        "delivery_fee": delivery_fee,
+                                "delivery_fee": delivery_fee,
                         "total_with_delivery": total_with_delivery,
                         "delivery_location_lat": latitude,
                         "delivery_location_lon": longitude,

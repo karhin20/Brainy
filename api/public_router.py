@@ -12,7 +12,7 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 
-@router.get("/public/products", tags=["Public"])
+@router.get("/products", tags=["Public"])
 async def get_public_products():
     """
     Public endpoint to fetch all available products.
