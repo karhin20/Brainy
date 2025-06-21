@@ -101,39 +101,53 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-async def call_gemini_intent_extraction(message: str) -> dict:
+async def call_gemini_intent_extraction(message: str, user_context: dict) -> dict:
     """
-    Call Gemini API to extract intent and product info from the user's message.
+    Call Gemini API to extract intent, products, and a response.
     """
     if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set, using fallback")
-        return {"intent": "buy", "products": ["tomatoes", "onions"] if "tomato" in message.lower() or "onion" in message.lower() else []}
-    
+        # Fallback for development if Gemini key is not set
+        if "order" in message: return {"intent": "check_status"}
+        if "buy" in message: return {"intent": "buy", "products": ["yam"]}
+        return {"intent": "greet", "response": "Hello! Welcome back to Ghana Fresh Market."}
+
     try:
         headers = {"Content-Type": "application/json"}
         params = {"key": GEMINI_API_KEY}
+        
+        # Build a more context-aware prompt
+        prompt_context = f"The user's name is {user_context.get('name', 'a returning customer')}."
+        if user_context.get('has_paid_order'):
+            prompt_context += " They have a paid order that is currently being processed."
+
         prompt = (
-            'You are a friendly and helpful assistant for "Fresh Market GH", a WhatsApp-based grocery store. '
-            'Your goal is to help users buy food items. '
-            "From the user's message, extract their intent and any food items they mentioned. "
-            '- If the intent is to buy or they list items, respond with {"intent": "buy", "products": ["item1", "item2"]}. '
-            '- If the user is just greeting (e.g., "hello", "hi"), respond with {"intent": "greet", "response": "Hello! Welcome to Fresh Market GH. What would you like to buy today?"}. '
-            '- For any other query, provide a helpful answer and gently guide them back to shopping. Format this as {"intent": "ask", "response": "Your helpful answer..."}. '
-            "Message: " + message
+            'You are a friendly and helpful assistant for "Ghana Fresh Market", a WhatsApp-based grocery store in Ghana. '
+            'Your primary goal is to help users buy food items or check on their existing orders. '
+            f'{prompt_context}\n\n'
+            "Analyze the user's message and respond in pure JSON format with three fields: 'intent', 'products' (a list of strings, can be empty), and 'response' (a conversational string). \n"
+            "Here are the possible intents:\n"
+            '- **buy**: The user wants to buy one or more items. Extract the items into the "products" list.\n'
+            '- **check_status**: The user is asking about their order (e.g., "where is my order?").\n'
+            '- **greet**: The user is just saying hello.\n'
+            '- **cancel_order**: The user wants to cancel their current pending order.\n'
+            '- **help**: The user is asking for help or is confused.\n'
+            '- **ask**: The user is asking a general question.\n\n'
+            "Example Scenarios:\n"
+            '1. Message: "hi i want to buy yam and onions" -> {"intent": "buy", "products": ["yam", "onions"], "response": "Great! I can help with that."}\n'
+            '2. Message: "where is my stuff" -> {"intent": "check_status", "products": [], "response": "Let me check on your order for you."}\n'
+            '3. Message: "hello" -> {"intent": "greet", "products": [], "response": "Hello! Welcome to Ghana Fresh Market. What can I get for you today?"}\n\n'
+            "User Message: " + message
         )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}]
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
+
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(GEMINI_API_URL, headers=headers, params=params, json=payload)
             response.raise_for_status()
             result = response.json()
             
-            # More robust JSON extraction
             text = result["candidates"][0]["content"]["parts"][0]["text"]
             try:
-                # The AI might return the JSON inside a markdown code block.
-                # Find the start and end of the JSON.
                 json_start_index = text.find('{')
                 json_end_index = text.rfind('}') + 1
                 if json_start_index != -1 and json_end_index != -1:
@@ -143,11 +157,10 @@ async def call_gemini_intent_extraction(message: str) -> dict:
                     raise json.JSONDecodeError("No JSON object found", text, 0)
             except json.JSONDecodeError:
                 logger.error(f"Failed to decode JSON from Gemini response: {text}")
-                # Fallback if JSON is malformed or not found
-                return {"intent": "ask", "products": [], "response": text}
+                return {"intent": "ask", "products": [], "response": text} # Return the raw text if parsing fails
     except Exception as e:
         logger.error(f"Gemini API error: {str(e)}", exc_info=True)
-        return {"intent": "error", "products": [], "response": "Sorry, I had a problem understanding that."}
+        return {"intent": "error", "products": [], "response": "Sorry, I'm having a little trouble understanding. Could you try rephrasing?"}
 
 async def send_whatsapp_message(to_number: str, message: str) -> dict:
     """
@@ -212,6 +225,95 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
         logger.error(f"Paystack API error: {str(e)}", exc_info=True)
         return f"https://paystack.com/pay/mock-{order_id}"
 
+async def handle_pending_order(order: Dict[str, Any], body: str, from_number: str) -> str:
+    """Handles interaction when a user already has an order with 'pending' status."""
+    order_id = order["id"]
+    
+    # Scenario A: Awaiting delivery type choice
+    if order.get("delivery_type") is None:
+        if body.lower() == "delivery":
+            supabase.table("orders").update({"delivery_type": "delivery"}).eq("id", order_id).execute()
+            return "Got it. Please share your delivery location so we can calculate the fee."
+        elif body.lower() == "pickup":
+            total_amount = order["total_amount"]
+            payment_link = await generate_paystack_payment_link(order_id, total_amount, from_number)
+            supabase.table("orders").update({"delivery_type": "pickup", "delivery_fee": 0, "total_with_delivery": total_amount}).eq("id", order_id).execute()
+            return f"Pickup selected. Your total is ₵{total_amount:.2f}. Please pay here to complete your order: {payment_link}"
+        else:
+            return "Please reply with either *Delivery* or *Pickup* to proceed."
+
+    # Scenario B: Awaiting location for a delivery order
+    elif order.get("delivery_type") == "delivery" and order.get("delivery_location") is None:
+        delivery_fee = calculate_delivery_fee(body)
+        total_with_delivery = order["total_amount"] + delivery_fee
+        payment_link = await generate_paystack_payment_link(order_id, total_with_delivery, from_number)
+        
+        supabase.table("orders").update({
+            "delivery_location": body,
+            "location_updated_at": datetime.utcnow().isoformat(),
+            "delivery_fee": delivery_fee,
+            "total_with_delivery": total_with_delivery
+        }).eq("id", order_id).execute()
+        
+        return f"Thanks! Your delivery fee is ₵{delivery_fee:.2f}, bringing your total to ₵{total_with_delivery:.2f}. Please pay here to finalize: {payment_link}"
+
+    # Scenario C: User has a pending order but sends a new message
+    else:
+        if body.lower() in ['cancel', 'cancel order']:
+            supabase.table("orders").update({"status": "cancelled"}).eq("id", order_id).execute()
+            return "Your pending order has been cancelled. Feel free to start a new one!"
+        
+        # If user tries to buy something new while having a pending order
+        intent_data = await call_gemini_intent_extraction(body, {})
+        if intent_data.get('intent') == 'buy':
+            return "You already have a pending order. To make changes, please reply with *Cancel* to cancel the current one first, then you can start a new order."
+
+        total = order.get("total_with_delivery") or order.get("total_amount")
+        payment_link = await generate_paystack_payment_link(order_id, total, from_number)
+        return f"It looks like you have an unpaid order with us. To complete it, please use this payment link: {payment_link}\n\nIf you want to cancel it, just reply with *Cancel*."
+
+async def handle_new_conversation(user: Dict[str, Any], body: str, from_number: str) -> str:
+    """Handles interaction when a user has no pending orders."""
+    user_id = user['id']
+
+    # Context for Gemini
+    user_context = {
+        "name": user.get("name"),
+        "has_paid_order": bool(supabase.table("orders").select("id").eq("user_id", user_id).in_("status", ["processing", "out-for-delivery"]).limit(1).execute().data)
+    }
+
+    intent_data = await call_gemini_intent_extraction(body, user_context)
+    intent = intent_data.get("intent")
+
+    if intent == "buy":
+        products = intent_data.get("products", [])
+        if not products:
+            return "It sounds like you want to buy something, but I couldn't catch what items. Could you please list them?"
+        session_token = str(uuid.uuid4())
+        selection_url = f"{FRONTEND_URL}?session={session_token}"
+        supabase.table("sessions").insert({
+            "user_id": user_id,
+            "phone_number": from_number,
+            "session_token": session_token,
+            "last_intent": "buy"
+        }).execute()
+        return f"Great! Please select the exact items and quantities from this secure link: {selection_url}"
+    
+    elif intent == "check_status":
+        paid_orders = supabase.table("orders").select("status").eq("user_id", user_id).in_("status", ["processing", "out-for-delivery"]).order("created_at", desc=True).limit(1).execute().data
+        if paid_orders:
+            return f"I've found your latest order. Its current status is: *{paid_orders[0]['status']}*."
+        else:
+            return "It looks like you don't have any paid orders with us right now. Can I help you start a new one?"
+            
+    elif intent == "greet":
+        return f"Hello! Welcome back to Ghana Fresh Market. What can I help you with today?"
+
+    else: # ask, help, error, etc.
+        return intent_data.get("response", "I'm not sure how to help with that. Could you try rephrasing?")
+
+
+
 @app.post("/whatsapp-webhook")
 async def whatsapp_webhook(request: Request):
     try:
@@ -223,87 +325,36 @@ async def whatsapp_webhook(request: Request):
         if not from_number:
             raise HTTPException(status_code=400, detail="Missing From number")
 
-        user_id = None
-        user = None
+        if not supabase:
+            await send_whatsapp_message(f"whatsapp:{from_number}", "Sorry, our service is temporarily unavailable. Please try again later.")
+            return {"status": "error", "message": "Supabase client not initialized"}
 
-        if supabase:
-            # Step 1: Find or Create the user and get their ID
-            user_res = supabase.table("users").upsert({"phone_number": from_number}, on_conflict="phone_number").execute()
-            if user_res.data:
-                user = user_res.data[0]
-                user_id = user['id']
-            else:
-                logger.error(f"Could not upsert or find user for phone number: {from_number}")
-                raise HTTPException(status_code=500, detail="User lookup failed")
+        # Step 1: Find or Create the user
+        user_res = supabase.table("users").upsert({"phone_number": from_number}, on_conflict="phone_number").execute()
+        if not user_res.data:
+            logger.error(f"Could not find or create user for phone number: {from_number}")
+            raise HTTPException(status_code=500, detail="User lookup failed")
+        user = user_res.data[0]
 
-            # Step 2: Check if this user has a pending order to handle delivery/location flow
-            order_query = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
-            
-            if order_query.data:
-                order = order_query.data[0]
-                # Check if this is a delivery type response
-                if order.get("delivery_type") is None:
-                    if body.lower() in ["delivery", "pickup"]:
-                        delivery_type = body.lower()
-                        delivery_fee = 0.00 if delivery_type == "pickup" else None
-                        total_with_delivery = order["total_amount"] if delivery_type == "pickup" else None
-                        
-                        # Update order with delivery type
-                        supabase.table("orders").update({
-                            "delivery_type": delivery_type,
-                            "delivery_fee": delivery_fee,
-                            "total_with_delivery": total_with_delivery
-                        }).eq("id", order["id"]).execute()
-                        
-                        if delivery_type == "delivery":
-                            response_message = "Please share your delivery location:"
-                        else:
-                            response_message = "Great! You can pick up your order at our store. Please proceed to payment."
-                    else:
-                        response_message = "Please choose delivery type: 'delivery' or 'pickup'"
-                elif order.get("delivery_type") == "delivery" and not order.get("delivery_location"):
-                    # Handle location input for delivery
-                    delivery_fee = calculate_delivery_fee(body)
-                    total_with_delivery = order["total_amount"] + delivery_fee
-                    
-                    # Update order with location and delivery fee
-                    supabase.table("orders").update({
-                        "delivery_location": body,
-                        "delivery_fee": delivery_fee,
-                        "total_with_delivery": total_with_delivery
-                    }).eq("id", order["id"]).execute()
-                    
-                    payment_link = await generate_paystack_payment_link(order["id"], total_with_delivery, from_number)
-                    response_message = f"Delivery fee: GHS {delivery_fee:.2f}\nTotal: GHS {total_with_delivery:.2f}\n\nPay here: {payment_link}"
-                else:
-                    response_message = "Your order is being processed. You'll receive updates shortly."
-            else:
-                # Step 3: If no pending order, proceed with Gemini for conversation
-                intent_data = await call_gemini_intent_extraction(body)
-                intent = intent_data.get("intent")
-                
-                if intent == "buy":
-                    products = intent_data.get("products", [])
-                    session_token = str(uuid.uuid4())
-                    selection_url = f"{FRONTEND_URL}?session={session_token}"
-                    response_message = f"Great! Please select the items you want from this link: {selection_url}"
-                    # Create a session LINKED to the user_id
-                    supabase.table("sessions").insert({
-                        "user_id": user_id,
-                        "phone_number": from_number,
-                        "session_token": session_token,
-                        "last_intent": "buy"
-                    }).execute()
-                else: # greet, ask, etc.
-                    response_message = intent_data.get("response", "I'm not sure how to help. Could you try rephrasing?")
+        # Step 2: Check for a pending order for this user
+        pending_order_res = supabase.table("orders").select("*").eq("user_id", user['id']).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
         
-            await send_whatsapp_message(f"whatsapp:{from_number}", response_message)
+        if pending_order_res.data:
+            response_message = await handle_pending_order(pending_order_res.data[0], body, from_number)
+        else:
+            response_message = await handle_new_conversation(user, body, from_number)
+    
+        await send_whatsapp_message(f"whatsapp:{from_number}", response_message)
         
         return {"status": "success", "message": "Webhook processed successfully"}
         
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}", exc_info=True)
+        # Avoid sending technical errors to the user
+        await send_whatsapp_message(f"whatsapp:{from_number}", "Sorry, an unexpected error occurred. Please try again in a moment.")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
 
 @app.post("/confirm-items")
 async def confirm_items(request: OrderRequest, api_key: str = Depends(verify_api_key)):
@@ -337,6 +388,7 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(verify_api
     except Exception as e:
         logger.error(f"Confirm items error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    
 
 @app.post("/payment-success")
 async def payment_success(request: Request, api_key: str = Depends(verify_api_key)):
@@ -368,6 +420,9 @@ async def payment_success(request: Request, api_key: str = Depends(verify_api_ke
     except Exception as e:
         logger.error(f"Payment success error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+
 
 @app.post("/delivery-status")
 async def delivery_status(request: DeliveryStatusUpdate, api_key: str = Depends(verify_api_key)):
@@ -393,6 +448,8 @@ async def delivery_status(request: DeliveryStatusUpdate, api_key: str = Depends(
     except Exception as e:
         logger.error(f"Delivery status error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
 def calculate_delivery_fee(location: str) -> float:
     """
