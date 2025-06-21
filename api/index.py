@@ -162,7 +162,12 @@ async def call_gemini_intent_extraction(message: str, user_context: dict) -> dic
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(GEMINI_API_URL, headers=headers, params=params, json=payload)
             response.raise_for_status()
-            return response.json()
+            
+            # Correctly parse the JSON payload from the Gemini response
+            result = response.json()
+            # The actual JSON content is a string within the 'text' field
+            json_text = result["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(json_text)
             
     except httpx.HTTPStatusError as e:
         logger.error(f"Gemini API HTTP Error: {e.response.text}", exc_info=True)
@@ -180,23 +185,23 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
         logger.warning("PAYSTACK_SECRET_KEY not set, using mock payment link")
         return f"https://paystack.com/pay/mock-{order_id}"
     
-        headers = {
-            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type": "application/json"
-        }
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
     
     # Generate a placeholder email as Paystack requires one.
     placeholder_email = f"{user_phone.replace('+', '')}@market.bot"
 
     payload = {
         "email": placeholder_email,
-            "amount": int(amount * 100),  # Paystack expects amount in kobo
-            "currency": "GHS",
-            "reference": order_id,
-            "callback_url": f"{FRONTEND_URL}/payment-success?order_id={order_id}",
-            "channels": ["card", "mobile_money"],
-            "metadata": {"order_id": order_id, "phone": user_phone}
-        }
+        "amount": int(amount * 100),  # Paystack expects amount in kobo
+        "currency": "GHS",
+        "reference": order_id,
+        "callback_url": f"{FRONTEND_URL}/payment-success?order_id={order_id}",
+        "channels": ["card", "mobile_money"],
+        "metadata": {"order_id": order_id, "phone": user_phone}
+    }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(PAYSTACK_PAYMENT_URL, headers=headers, json=payload)
@@ -420,7 +425,7 @@ async def whatsapp_webhook(request: Request):
                     # Update order with delivery details
                     update_data = {
                         "status": "pending_payment",
-                                "delivery_fee": delivery_fee,
+                        "delivery_fee": delivery_fee,
                         "total_with_delivery": total_with_delivery,
                         "delivery_location_lat": latitude,
                         "delivery_location_lon": longitude,
