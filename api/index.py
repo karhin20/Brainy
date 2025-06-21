@@ -139,9 +139,13 @@ async def send_whatsapp_message(to_number: str, message: str) -> dict:
     
     try:
         url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+        
+        # Ensure 'whatsapp:' prefix is present for outgoing messages
+        to_prefixed = to_number if to_number.startswith("whatsapp:") else f"whatsapp:{to_number}"
+        
         data = {
             "From": f"whatsapp:{TWILIO_WHATSAPP_NUMBER}",
-            "To": to_number if to_number.startswith("whatsapp:") else f"whatsapp:{to_number}",
+            "To": to_prefixed,
             "Body": message
         }
         auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -189,8 +193,12 @@ async def whatsapp_webhook(request: Request):
         # Twilio sends form data, not JSON
         form_data = await request.form()
         
-        from_number = form_data.get("From")
+        raw_from_number = form_data.get("From")
         body = form_data.get("Body", "").strip()
+        
+        # Clean the phone number to remove the 'whatsapp:' prefix
+        from_number = raw_from_number.replace("whatsapp:", "") if raw_from_number else None
+        
         session_token = form_data.get("session") or str(uuid.uuid4())
 
         # Validate Twilio request
