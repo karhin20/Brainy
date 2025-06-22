@@ -245,6 +245,7 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
             - `help`: User is asking for instructions, how to use the service, or general support.
             - `repeat`: User is asking you to repeat the last message or information you sent.
             - `thank_you`: User is expressing gratitude (e.g., thank you, thanks).
+            - `affirmative_acknowledgement`: User is confirming information or giving a simple positive reply (e.g., okay, ok, got it, sounds good, sure).
             - `unknown`: The message is irrelevant to grocery shopping, unclear, or outside the bot's capabilities (e.g., telling a joke, asking for personal details, spam).
 
             Your JSON output MUST contain these two fields:
@@ -257,6 +258,7 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
                 - `help`: "I can help with that. What do you need?"
                 - `repeat`: "Certainly, I can repeat that."
                 - `thank_you`: "You're welcome!"
+                - `affirmative_acknowledgement`: "Great! Is there anything else I can help you with?"
                 - `unknown`: "I'm sorry, I can only help with grocery orders."
 
             Example response format:
@@ -343,6 +345,8 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
                   return {"intent": "repeat", "response": "Certainly, I can repeat that."}
              if any(word in lower_msg for word in ["thank", "thanks"]):
                   return {"intent": "thank_you", "response": "You're welcome!"}
+             if lower_msg in ["ok", "okay", "k", "ok."]:
+                 return {"intent": "affirmative_acknowledgement", "response": "Great! Is there anything else I can help you with?"}
              return {"intent": "unknown", "response": "I'm sorry, I can only assist with grocery orders. Could you please rephrase?"}
          else:
              # Handle other ValueErrors from call_gemini_api (e.g. empty text payload)
@@ -587,9 +591,8 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
                 "To start, just say 'I want to buy...' or 'Show me the menu'."
             )
         else:
-            user_name = user.get('name')
-            greeting_name = f", {user_name}!" if user_name else "!"
-            reply_message = f"{ai_response_ack}{greeting_name} How can I help you with your groceries today?"
+            # For returning users, the AI response is already a polite and complete greeting.
+            reply_message = ai_response_ack
 
 
     elif intent == "help":
@@ -614,6 +617,9 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     elif intent == "thank_you":
         # Already returns AI ack, fits the pattern.
          reply_message = ai_response_ack
+
+    elif intent == "affirmative_acknowledgement":
+        reply_message = ai_response_ack
 
     else: # unknown or any other unhandled intent by Gemini/fallback
         logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{original_message}')")
