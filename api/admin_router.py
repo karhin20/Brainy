@@ -151,7 +151,7 @@ class AdminUser(BaseModel):
     created_at: datetime
     phone_number: str
     last_active: datetime | None = None
-    is_blocked: bool
+    is_blocked: bool | None = None
 
 class DashboardStats(BaseModel):
     total_revenue: float

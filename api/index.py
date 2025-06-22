@@ -43,15 +43,34 @@ except Exception as e:
 
 # Import routers and security module
 try:
+    # Correct relative import path for modules within the same package
+    # Assuming index.py is in the package root or directly next to these modules
+    # If index.py is in a subdir like 'api', this needs adjustment
     from . import admin_router, security, auth_router, public_router
     from .utils import send_whatsapp_message
     send_whatsapp_message_available = True
 except ImportError as e:
     logger.error(f"Failed to import internal modules (routers, security, utils): {e}", exc_info=True)
-    admin_router, security, auth_router, public_router = None, None, None, None
-    send_whatsapp_message_available = False
-    async def send_whatsapp_message(to: str, body: str):
-        logger.error(f"send_whatsapp_message utility is not available. Tried to send to {to}: {body}")
+    # Assign None only if the specific import failed
+    # Re-import if necessary to ensure names exist even if None
+    try:
+        from . import admin_router, security, auth_router, public_router
+    except ImportError:
+        admin_router, security, auth_router, public_router = None, None, None, None
+
+    try:
+        from .utils import send_whatsapp_message as _swm # Import with alias if possible
+        send_whatsapp_message_available = True
+        send_whatsapp_message = _swm # Re-assign the imported function
+    except ImportError:
+         send_whatsapp_message_available = False
+         async def send_whatsapp_message(to: str, body: str):
+             logger.error(f"send_whatsapp_message utility is not available. Tried to send to {to}: {body}")
+    except Exception as ex:
+         logger.error(f"Unexpected error assigning send_whatsapp_message: {ex}", exc_info=True)
+         send_whatsapp_message_available = False
+         async def send_whatsapp_message(to: str, body: str):
+             logger.error(f"send_whatsapp_message utility is not available. Tried to send to {to}: {body}")
 
 
 # --- Configuration Management using Pydantic Settings ---
@@ -145,8 +164,9 @@ async def error_handling_middleware(request: Request, call_next):
 
 
 # --- Include Routers ---
-if admin_router:
-    app.include_router(admin_router.router, prefix="/admin", tags=["admin"])
+# Check if security module was imported successfully before using it in dependencies
+if security and admin_router:
+    app.include_router(admin_router.router, prefix="/admin", tags=["admin"], dependencies=[Depends(security.get_admin_user)]) # Assuming admin routes need admin auth
 if auth_router:
     app.include_router(auth_router.router, prefix="/auth", tags=["auth"])
 if public_router:
@@ -179,10 +199,18 @@ async def root():
 async def health_check():
     """Basic health check endpoint."""
     db_status = "ok" if supabase else "unavailable"
+    whatsapp_util_status = "ok" if send_whatsapp_message_available else "unavailable"
+    paystack_key_status = "set" if settings.PAYSTACK_SECRET_KEY else "not set (mock links active)"
+    gemini_key_status = "set" if settings.GEMINI_API_KEY else "not set (fallback active)"
+
+
     # Add more robust external service checks here if needed
     return {
         "status": "healthy",
         "database": db_status,
+        "whatsapp_utility": whatsapp_util_status,
+        "paystack_secret_key": paystack_key_status,
+        "gemini_api_key": gemini_key_status,
         "external_services": {}, # Placeholder
         "timestamp": datetime.now().isoformat()
     }
@@ -251,22 +279,30 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
             response.raise_for_status() # Raises HTTPStatusError
 
             result = response.json()
+            # Safely navigate nested dictionary, providing default empty values
             json_text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
 
             if not json_text:
-                 error_msg = result.get("candidates", [{}])[0].get("finishReason", "no text")
-                 logger.error(f"Gemini API response missing expected text payload: {result}")
-                 raise ValueError(f"Gemini API returned empty text payload or error: {error_msg}")
+                 error_msg_detail = "No text payload received."
+                 finish_reason = result.get("candidates", [{}])[0].get("finishReason")
+                 if finish_reason:
+                     error_msg_detail = f"API finished with reason: {finish_reason}"
 
+                 logger.error(f"Gemini API response missing expected text payload: {result}. Detail: {error_msg_detail}")
+                 # Include finishReason in the error message if available
+                 raise ValueError(f"Gemini API returned empty text payload or error: {finish_reason or 'Unknown API Error'}")
+
+
+            # Attempt to parse the JSON text
             return json.loads(json_text) # Raise JSONDecodeError if invalid
 
     except httpx.RequestError as e:
         logger.error(f"Gemini API communication error: {e}", exc_info=True)
         raise # Re-raise the exception
     except json.JSONDecodeError as e:
-        logger.error(f"Error decoding Gemini response JSON: {e}", exc_info=True)
+        logger.error(f"Error decoding Gemini response JSON: {e}. Raw text was: {json_text}", exc_info=True)
         raise # Re-raise the exception
-    except ValueError as e: # From missing text payload check
+    except ValueError as e: # From missing text payload check or GEMINI_API_KEY not set
         logger.error(f"Error processing Gemini response: {e}", exc_info=True)
         raise # Re-raise the exception
     except Exception as e:
@@ -312,7 +348,8 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
          else:
              # Handle other ValueErrors from call_gemini_api (e.g. empty text payload)
              logger.error(f"Error processing Gemini response: {e}", exc_info=True)
-             return {"intent": "unknown", "response": f"There was an issue processing the response from my service: {e}. Please try again."}
+             return {"intent": "unknown", "response": f"There was an issue processing the response from my service. Please try again."} # Removed detailed error for user
+
 
     except httpx.RequestError as e:
         logger.error(f"Gemini API communication error: {e}", exc_info=True)
@@ -331,12 +368,17 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
     Generate a Paystack payment link for the order.
     Raises a specific exception if the API call fails.
     """
+    if amount <= 0:
+        logger.warning(f"Attempted to generate payment link for non-positive amount: {amount:.2f} for order {order_id}")
+        raise ValueError("Amount must be positive to generate payment link.")
+
     if not settings.PAYSTACK_SECRET_KEY:
         logger.warning("PAYSTACK_SECRET_KEY not set, cannot generate real payment link. Using mock link.")
-        if amount <= 0:
-             raise ValueError("Amount must be positive to generate payment link.")
-        return f"{settings.FRONTEND_URL}/mock-payment-success?order_id={order_id}&amount={amount:.2f}"
+        # Using frontend URL as a mock payment success page
+        return f"{settings.FRONTEND_URL}/payment-success?order_id={order_id}&amount={amount:.2f}&mock_success=true"
 
+    # --- CORRECTED INDENTATION ---
+    # The following block should only execute if PAYSTACK_SECRET_KEY IS set.
     headers = {
         "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
         "Content-Type": "application/json"
@@ -347,41 +389,51 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
 
     payload = {
         "email": placeholder_email,
-        "amount": int(amount * 100),
+        "amount": int(amount * 100), # Amount in pesewas/kobo
         "currency": "GHS",
         "reference": unique_reference,
-        "callback_url": f"{settings.FRONTEND_URL}/payment-success?order_id={order_id}",
-        "channels": ["card", "mobile_money"],
-        "metadata": {"order_id": order_id, "phone": user_phone}
+        "callback_url": f"{settings.FRONTEND_URL}/payment-success?order_id={order_id}", # Paystack calls this URL
+        "channels": ["card", "mobile_money", "bank", "bank_transfer", "ussd"], # Include common channels
+        "metadata": {"order_id": order_id, "phone": user_phone, "reference": unique_reference} # Include ref in metadata too
     }
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(settings.PAYSTACK_PAYMENT_URL, headers=headers, json=payload)
-            response.raise_for_status()
+            response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx responses
 
             data = response.json()
+            # Paystack returns { "status": true, "message": "...", "data": { ... authorization_url ... } }
             if data.get("status") is True and data.get("data") and data["data"].get("authorization_url"):
-                 logger.info(f"Successfully generated Paystack link for order {order_id}. Reference: {unique_reference}")
-                 return data["data"]["authorization_url"]
+                logger.info(f"Successfully generated Paystack link for order {order_id}. Reference: {unique_reference}")
+                return data["data"]["authorization_url"]
             else:
-                 logger.error(f"Paystack API returned success=true but missing auth_url or unexpected data: {data}")
-                 raise ValueError("Paystack API response format error during link generation.")
+                # Log the full response for debugging if expected structure is missing
+                logger.error(f"Paystack API returned success=true but missing auth_url or unexpected data for order {order_id}: {data}")
+                raise ValueError("Paystack API response format error during link generation.")
 
     except httpx.RequestError as e:
-         logger.error(f"Paystack API request error: {e}", exc_info=True)
+         logger.error(f"Paystack API request error for order {order_id}: {e}", exc_info=True)
          if isinstance(e, httpx.HTTPStatusError):
               if e.response.status_code in [401, 403]:
                   raise Exception("Payment gateway authentication failed. Please contact support.") from e
               elif e.response.status_code == 400:
-                   raise Exception(f"Invalid request to payment gateway: {e.response.text}") from e
+                   # Include Paystack's error message if available
+                   error_detail = e.response.text
+                   try:
+                       error_json = e.response.json()
+                       error_detail = error_json.get('message', error_detail)
+                   except json.JSONDecodeError:
+                        pass # Ignore if response isn't JSON
+                   raise Exception(f"Invalid request to payment gateway: {error_detail}") from e
               else:
                    raise Exception(f"Payment gateway error ({e.response.status_code}). Please try again later.") from e
          else:
               raise Exception(f"Could not connect to payment gateway: {e}. Please check your internet connection.") from e
     except Exception as e:
+        # Catch any other unexpected errors during JSON parsing or data extraction
         logger.error(f"Unexpected error during Paystack link generation for order {order_id}: {str(e)}", exc_info=True)
-        raise Exception(f"An error occurred during payment link generation: {e}") from e
+        raise Exception(f"An unexpected error occurred during payment link generation.") from e # Generic error for user
 
 
 def verify_paystack_signature(request_body: bytes, signature: str, secret_key: Optional[str]) -> bool:
@@ -394,9 +446,10 @@ def verify_paystack_signature(request_body: bytes, signature: str, secret_key: O
         return False
 
     try:
+        # CORRECTED: Removed .encode() from request_body as it's already bytes
         expected_signature = hmac.new(
-            secret_key.encode('utf-8'),
-            request_body,
+            secret_key.encode('utf-8'), # Secret key needs encoding
+            request_body,             # Body is already bytes
             hashlib.sha512
         ).hexdigest()
 
@@ -404,8 +457,8 @@ def verify_paystack_signature(request_body: bytes, signature: str, secret_key: O
 
         if not is_valid:
             logger.warning("Paystack webhook signature verification failed.")
-        else:
-            logger.info("Paystack webhook signature verified successfully.")
+        #else: # Keep logging successful verification only at info level if needed elsewhere, or remove for brevity
+        #    logger.info("Paystack webhook signature verified successfully.")
 
         return is_valid
     except Exception as e:
@@ -419,115 +472,126 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     Routes messages based on the intent extracted by Gemini or fallback logic.
     Includes is_new_user flag for tailored responses.
     Accepts original_message for logging/context if needed.
+    Returns the message to be sent back to the user.
     """
     user_id = user['id']
     intent_data = gemini_result
     intent = intent_data.get("intent")
-    ai_response_ack = intent_data.get("response", "Okay.")
+    ai_response_ack = intent_data.get("response", "Okay.") # Default fallback ack
 
     logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}. Message: '{original_message}'")
 
+    reply_message = "" # Initialize reply message here
+
     if intent == "buy":
+        # Ensure supabase is available for database operations
+        if not supabase:
+             logger.error(f"Supabase client not available for 'buy' intent session creation for user {user_id}.")
+             return "Sorry, I'm currently having technical difficulties and cannot start a new order. Please try again later."
+
         session_token = str(uuid.uuid4())
-        selection_url = f"{settings.FRONTEND_URL}/menu?session={session_token}"
+        selection_url = f"{settings.FRONTEND_URL}?session={session_token}"
         try:
-            supabase.table("sessions").insert({
+            # Add a check for existing active sessions for this user/phone if needed,
+            # though current logic relies on the /confirm-items cleanup.
+            # For simplicity, proceeding with insert.
+            insert_res = supabase.table("sessions").insert({
                 "user_id": user_id,
                 "phone_number": from_number,
                 "session_token": session_token,
-                "last_intent": "buy",
+                "last_intent": "buy", # Store intent for session context if needed later
                 "created_at": datetime.now().isoformat(),
+                # Sessions expire after 24 hours
                 "expires_at": (datetime.now() + timedelta(hours=24)).isoformat()
             }).execute()
+            # Check result for success if the supabase client version supports it returning data/status
+            if not insert_res.data:
+                logger.warning(f"Supabase session insert executed but returned no data for user {user_id}, token {session_token}.")
+
             logger.info(f"Created new session {session_token} for user {user_id}")
 
-            # **APPLIED TO BUY:** Combine AI acknowledgement with menu link message
+            # Combine AI acknowledgement with menu link message
             greeting_part = "Welcome! " if is_new_user else ""
-            return (
-                f"{ai_response_ack} {greeting_part}"
+            reply_message = (
+                f"{ai_response_ack} {greeting_part}" # E.g., "Okay, let's start your order. Welcome! "
                 f"You can select the fresh items you'd like to purchase from our online menu here:\n"
                 f"{selection_url}"
             )
         except Exception as e:
             logger.error(f"Failed to create session for user {user_id} (buy intent): {e}", exc_info=True)
-            return "Sorry, I'm having trouble starting a new order right now. Please try again in a moment."
+            reply_message = "Sorry, I'm having trouble starting a new order right now. Please try again in a moment."
 
     elif intent == "check_status":
+        if not supabase:
+            logger.error(f"Supabase client not available for 'check_status' intent for user {user_id}.")
+            return f"{ai_response_ack} I'm having trouble checking your order details because my database is unavailable."
+
         try:
             # Look for the latest paid order that's not cancelled or delivered.
             # Select ALL relevant fields including status, type, fees, location if available
             active_paid_orders_res = supabase.table("orders").select("status, id, delivery_type, delivery_fee, total_amount, total_with_delivery, delivery_location_lat, delivery_location_lon").eq("user_id", user_id).in_("payment_status", [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]).not_.in_("status", [DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
 
-            # **APPLIED TO CHECK_STATUS:** Provide detailed message based on the found order's specific status
+            # Provide detailed message based on the found order's specific status
             if active_paid_orders_res.data:
                 latest_order = active_paid_orders_res.data[0]
                 order_id = latest_order['id']
                 current_order_status = latest_order['status']
                 delivery_type = latest_order.get('delivery_type', 'N/A')
                 total_display = latest_order.get('total_with_delivery') or latest_order.get('total_amount')
+                total_display_formatted = f"{total_display:.2f}" if total_display is not None else "N/A"
 
                 status_display = current_order_status.replace('-', ' ').title()
-                delivery_type_display = delivery_type.title()
+                delivery_type_display = delivery_type.replace('_', ' ').title()
 
                 # Build a status-specific message
-                status_message = f"{ai_response_ack} Your latest active order (ID: {order_id}) is currently *{status_display}* ({delivery_type_display})."
+                reply_message = f"{ai_response_ack} Your latest active order (ID: {order_id}) is currently *{status_display}* ({delivery_type_display})."
 
+                # Add more context based on specific status
                 if current_order_status == DefaultStatus.ORDER_PROCESSING:
-                    status_message += "\nWe are currently preparing your items."
+                    reply_message += "\nWe are currently preparing your items."
                     if delivery_type == 'delivery':
-                         status_message += " We'll notify you once it's out for delivery."
+                         reply_message += " We'll notify you once it's out for delivery."
                 elif current_order_status == DefaultStatus.ORDER_OUT_FOR_DELIVERY:
-                     status_message += "\nYour order is out for delivery!"
-                     # Add estimated time or tracking link if available in DB
+                     reply_message += "\nYour order is out for delivery!"
+                     # TODO: Add estimated time or tracking link if available in DB/system
                 elif current_order_status == DefaultStatus.ORDER_DELIVERED:
-                     # Although filtered out by not_.in_, handle defensively
-                     status_message = f"{ai_response_ack} Your latest order (ID: {order_id}) was delivered."
+                     # Although filtered out by not_.in_, handle defensively (shouldn't happen here)
+                     reply_message = f"{ai_response_ack} Your latest order (ID: {order_id}) was delivered."
                 elif current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT:
                      # Although filtered out by payment_status check, handle defensively
-                     status_message = f"{ai_response_ack} You have a pending order (ID: {order_id}) waiting for payment. Total: GHS {total_display:.2f}."
-                     # Could add payment link here, but this branch is for paid orders primarily
+                     reply_message = f"{ai_response_ack} You have a pending order (ID: {order_id}) waiting for payment. Total: GHS {total_display_formatted}."
+                     # Could add payment link here, but this branch is for *paid* orders primarily
 
-                # Check if the user specifically asked about payment or pickup within the check_status intent
+                # Check if the user specifically asked about payment or pickup within the check_status intent (Less likely for paid orders, but possible)
                 lower_original_message = original_message.lower()
-                if current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT and ("paid" in lower_original_message or "payment" in lower_original_message):
-                     status_message = f"{ai_response_ack} I'm checking for payment confirmation for your order (ID: {order_id}). Its current status is still *{status_display}* ({delivery_type_display}). Please allow a few minutes for the payment to reflect. If you paid recently and the status doesn't update, please contact support."
-                elif current_order_status == DefaultStatus.ORDER_AWAITING_LOCATION and ("location" in lower_original_message or "address" in lower_original_message):
-                      status_message = f"{ai_response_ack} I see your order (ID: {order_id}) is waiting for your delivery location. Please share it using the WhatsApp location feature."
-                elif current_order_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION and ("location" in lower_original_message or "address" in lower_original_message):
-                      status_message = f"{ai_response_ack} I see your order (ID: {order_id}) is waiting for you to confirm your saved location or provide a new one."
-                elif current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT and delivery_type == 'pickup' and ("pickup" in lower_original_message or "collect" in lower_original_message or "when can i come" in lower_original_message):
-                      # If pickup is awaiting payment, remind them to pay first
-                      status_message = f"{ai_response_ack} Your pickup order (ID: {order_id}) is waiting for payment. Total: GHS {total_display:.2f}. Please complete payment to confirm pickup."
-                elif current_order_status == DefaultStatus.ORDER_PROCESSING and delivery_type == 'pickup' and ("pickup" in lower_original_message or "collect" in lower_original_message or "when can i come" in lower_original_message or "ready" in lower_original_message):
+                # Re-check if the user specifically asked about pickup for a processing pickup order
+                if current_order_status == DefaultStatus.ORDER_PROCESSING and delivery_type == 'pickup' and ("pickup" in lower_original_message or "collect" in lower_original_message or "when can i come" in lower_original_message or "ready" in lower_original_message):
                      # If pickup is processing, provide info if ready
-                     # **NOTE:** This requires logic to determine if a processing pickup order is *actually* ready. This usually comes from an internal update (admin panel). For now, give a generic 'processing' pickup message.
-                     status_message = f"{ai_response_ack} Your pickup order (ID: {order_id}) is currently being prepared. We'll notify you as soon as it's ready for collection."
+                     # TODO: This requires logic to determine if a processing pickup order is *actually* ready. This usually comes from an internal update (admin panel). For now, give a generic 'processing' pickup message.
+                     reply_message += "\nWe'll notify you as soon as your pickup order is ready for collection."
                 elif current_order_status == DefaultStatus.ORDER_OUT_FOR_DELIVERY and delivery_type == 'delivery' and ("when will it arrive" in lower_original_message or "where is it" in lower_original_message):
-                     status_message = f"{ai_response_ack} Your delivery order (ID: {order_id}) is out for delivery!" # Could add ETA or tracking link here if available
+                     reply_message += "\nYour driver is on the way!" # Could add ETA or tracking link here if available
 
-
-                return status_message # Return the detailed status message
 
             else:
                 # No active paid orders found, check for a recent delivered one
                 recent_delivered_res = supabase.table("orders").select("id").eq("user_id", user_id).eq("status", DefaultStatus.ORDER_DELIVERED).order("created_at", desc=True).limit(1).execute()
                 if recent_delivered_res.data:
-                    return f"{ai_response_ack} Your latest order (ID: {recent_delivered_res.data[0]['id']}) has already been delivered. Can I help you start a new one?"
+                    reply_message = f"{ai_response_ack} Your latest order (ID: {recent_delivered_res.data[0]['id']}) has already been delivered. Can I help you start a new one?"
                 else:
-                     return f"{ai_response_ack} It looks like you don't have any active orders right now. Can I help you start a new one?"
+                     reply_message = f"{ai_response_ack} It looks like you don't have any active orders right now. Can I help you start a new one?"
         except Exception as e:
             logger.error(f"Error checking order status for user {user_id}: {e}", exc_info=True)
-            return f"{ai_response_ack} I'm having trouble looking up your order details right now. Please try again in a moment."
+            reply_message = f"{ai_response_ack} I'm having trouble looking up your order details right now. Please try again in a moment."
 
     elif intent == "cancel_order":
-        # **APPLIED TO CANCEL_ORDER:** Combine AI acknowledgement with the 'no pending' message
-        return f"{ai_response_ack} You don't have any pending orders to cancel right now."
+        # Combine AI acknowledgement with the 'no pending' message
+        reply_message = f"{ai_response_ack} You don't have any pending orders to cancel right now." # This is the case when *no* pending order is found before this function is called.
 
     elif intent == "greet":
-        # **APPLIED TO GREET:** Combine AI acknowledgement with the welcome/welcome back message
-        # This part looks correct now based on the desired output
+        # Combine AI acknowledgement with the welcome/welcome back message
         if is_new_user:
-            return (
+            reply_message = (
                 f"{ai_response_ack}\n\n" # E.g., "Hello! How can I assist you today?"
                 "I can help you order fresh groceries.\n\n"
                 "To start, just say 'I want to buy...' or 'Show me the menu'."
@@ -535,13 +599,12 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         else:
             user_name = user.get('name')
             greeting_name = f", {user_name}!" if user_name else "!"
-            # Ensure only one greeting part
-            return f"{ai_response_ack}{greeting_name} How can I help you with your groceries today?"
+            reply_message = f"{ai_response_ack}{greeting_name} How can I help you with your groceries today?"
 
 
     elif intent == "help":
-        # **APPLIED TO HELP:** Combine AI ack with help text
-         return (
+        # Combine AI ack with help text
+         reply_message = (
              f"{ai_response_ack}\n\n" # Start with AI's canned "I can help with that. What do you need?"
              "I can help you with the following:\n\n" # Clearly introduce the list
              "🛒 *Starting a new grocery order:*\n Just say 'I want to buy...' or 'Show me the menu'.\n\n"
@@ -552,19 +615,23 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     elif intent == "repeat":
         last_msg = user.get('last_bot_message')
-        # **APPLIED TO REPEAT:** Combine AI acknowledgement with the repeated message
+        # Combine AI acknowledgement with the repeated message
         if last_msg:
-            return f"{ai_response_ack}\n\nI last said:\n> {last_msg}"
+            reply_message = f"{ai_response_ack}\n\nI last said:\n> {last_msg}"
         else:
-            return f"{ai_response_ack} I don't have a recent message to repeat right now."
+            reply_message = f"{ai_response_ack} I don't have a recent message to repeat right now."
 
     elif intent == "thank_you":
-        # **APPLIED TO THANK_YOU:** Already returns AI ack, fits the pattern.
-         return ai_response_ack
+        # Already returns AI ack, fits the pattern.
+         reply_message = ai_response_ack
 
-    else: # unknown or any other unhandled intent
+    else: # unknown or any other unhandled intent by Gemini/fallback
         logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{original_message}')")
-        return ai_response_ack # This should be "I'm sorry, I can only help with grocery orders."
+        # The default response from get_intent_gracefully handles the "unknown" case
+        reply_message = ai_response_ack # This should be "I'm sorry, I can only help with grocery orders."
+
+
+    return reply_message # Return the determined message
 
 
 def calculate_delivery_fee(lat: float, lon: float) -> float:
@@ -574,6 +641,12 @@ def calculate_delivery_fee(lat: float, lon: float) -> float:
     """
     # Coordinates for a central point in Accra (e.g., Kwame Nkrumah Interchange)
     central_lat, central_lon = 5.5560, -0.2057
+
+    # Validate coordinates to prevent mathematical errors with extreme values
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        logger.error(f"Invalid coordinates provided for delivery fee calculation: {lat},{lon}")
+        # Return a high default fee or raise an error depending on desired behavior
+        return 100.00 # Return a high fee for invalid input
 
     R = 6371 # Radius of Earth in kilometers
 
@@ -585,24 +658,38 @@ def calculate_delivery_fee(lat: float, lon: float) -> float:
     dlon = lon2_rad - lon1_rad
     dlat = lat2_rad - lat1_rad
 
+    # Use abs() for dlat and dlon just in case, though the formula should handle signs
     a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)) # atan2 handles edge cases better than simple atan
 
     distance_km = R * c # Distance in km
 
     # Define fee based on distance tiers (adjust thresholds and fees as needed)
-    if distance_km < 5:
+    # Using a simple linear increase with thresholds
+    fee = 0.0
+
+    if distance_km < 2: # Very close
+        fee = 10.00
+    elif distance_km < 5:
         fee = 15.00
     elif distance_km < 10:
         fee = 25.00
+    elif distance_km < 15:
+         fee = 30.00
     elif distance_km < 20:
          fee = 35.00
+    elif distance_km < 25:
+         fee = 40.00
     elif distance_km < 30:
          fee = 45.00
-    else:
-        fee = 60.00
+    else: # Beyond 30km, potentially cap or scale differently
+        fee = 50.00 + (distance_km - 30) * 1.5 # Example: Add GHS 1.50 for every KM over 30
+        # Set a hard cap if needed
+        # fee = min(fee, 100.00) # Example cap at GHS 100
+
         if distance_km > 50:
-             logger.warning(f"Delivery requested outside standard range: {distance_km:.2f} km from center {central_lat},{central_lon}. Applying max fee.")
+             logger.warning(f"Delivery requested significantly outside standard range: {distance_km:.2f} km from center {central_lat},{central_lon}. Calculated fee: {fee:.2f}")
+
 
     logger.info(f"Calculated delivery fee: GHS {fee:.2f} for location {lat},{lon} ({distance_km:.2f} km from center)")
     return fee
@@ -617,38 +704,49 @@ async def whatsapp_webhook(request: Request):
     Handles user identification, state management (pending orders), and intent routing.
     Returns 200 OK to the webhook provider regardless of internal processing success.
     """
-    form_data = await request.form()
-    from_number = form_data.get("From")
-    incoming_msg = form_data.get("Body", "").strip() # Capture the incoming message
-
-    if not from_number:
-        logger.warning("Received webhook without 'From' number field.")
-        return JSONResponse(content={}, status_code=status.HTTP_200_OK)
-
-    from_number_clean = from_number.replace("whatsapp:", "")
-    logger.info(f"Received message from {from_number_clean}. Form Data Keys: {list(form_data.keys())}")
-    if incoming_msg:
-        logger.info(f"Message Body: '{incoming_msg}'")
-
-
-    # Determine if it's a location message
-    is_location_message = "Latitude" in form_data and "Longitude" in form_data
-    latitude, longitude = None, None
-    if is_location_message:
-        try:
-            latitude = float(form_data.get("Latitude"))
-            longitude = float(form_data.get("Longitude"))
-            logger.info(f"Received location message from {from_number_clean}: {latitude},{longitude}")
-        except (ValueError, TypeError) as e:
-            logger.error(f"Could not parse location coordinates from webhook for user {from_number_clean}. Data: {form_data}. Error: {e}", exc_info=True)
-            is_location_message = False # Treat as invalid location message
-
-    # Determine if it's a media message (other than location, which is handled separately)
-    is_media_message = form_data.get("NumMedia", "0") != "0" and not is_location_message
-
-    reply_message = "" # Initialize reply message
+    # Initialize reply_message early
+    reply_message = ""
+    from_number_clean = "unknown" # Default for logging if 'From' is missing
 
     try:
+        form_data = await request.form()
+        from_number = form_data.get("From")
+
+        if not from_number:
+            logger.warning("Received webhook without 'From' number field.")
+            # Return 200 OK to prevent repeated attempts from webhook provider
+            return JSONResponse(content={"detail": "No 'From' number"}, status_code=status.HTTP_200_OK)
+
+        from_number_clean = from_number.replace("whatsapp:", "")
+        incoming_msg = form_data.get("Body", "").strip() # Capture the incoming message
+
+        logger.info(f"Received message from {from_number_clean}. Form Data Keys: {list(form_data.keys())}")
+        if incoming_msg:
+            logger.info(f"Message Body: '{incoming_msg}'")
+
+        # --- Ensure Supabase is available ---
+        if not supabase:
+             logger.error(f"Supabase client not available for processing message from {from_number_clean}.")
+             if send_whatsapp_message_available:
+                 await send_whatsapp_message(from_number_clean, "Sorry, I'm currently experiencing technical difficulties. Please try again later.")
+             return JSONResponse(content={"detail": "Database unavailable"}, status_code=status.HTTP_200_OK)
+
+
+        # Determine if it's a location message
+        is_location_message = "Latitude" in form_data and "Longitude" in form_data
+        latitude, longitude = None, None
+        if is_location_message:
+            try:
+                latitude = float(form_data.get("Latitude"))
+                longitude = float(form_data.get("Longitude"))
+                logger.info(f"Received location message from {from_number_clean}: {latitude},{longitude}")
+            except (ValueError, TypeError) as e:
+                logger.error(f"Could not parse location coordinates from webhook for user {from_number_clean}. Data: {form_data}. Error: {e}", exc_info=True)
+                is_location_message = False # Treat as invalid location message
+
+        # Determine if it's a media message (other than location, which is handled separately)
+        is_media_message = form_data.get("NumMedia", "0") != "0" and not is_location_message
+
         # --- 1. Find or Create User ---
         user_res = supabase.table("users").select("*").eq("phone_number", from_number_clean).limit(1).execute()
         user = user_res.data[0] if user_res.data else None
@@ -657,11 +755,28 @@ async def whatsapp_webhook(request: Request):
         if not user:
             is_new_user = True
             try:
-                # CORRECTED: Removed .select("*") from the insert query
+                # CORRECTED: Removed .select("*") from the insert query - execute() might still return data depending on version
                 insert_res = supabase.table("users").insert({"phone_number": from_number_clean}).execute()
                 # Assuming execute() on insert returns data in this client version
-                user = insert_res.data[0]
-                logger.info(f"Created new user with id {user['id']} for phone {from_number_clean}")
+                if insert_res.data:
+                    user = insert_res.data[0]
+                    logger.info(f"Created new user with id {user['id']} for phone {from_number_clean}")
+                else:
+                     # Handle case where insert succeeds but returns no data
+                     logger.error(f"Supabase insert executed but returned no data for new user {from_number_clean}.")
+                     # Attempt to fetch the user again immediately
+                     user_res_after_insert = supabase.table("users").select("*").eq("phone_number", from_number_clean).limit(1).execute()
+                     if user_res_after_insert.data:
+                          user = user_res_after_insert.data[0]
+                          logger.info(f"Successfully fetched newly created user {user['id']} after no data return.")
+                     else:
+                         # Critical failure: User creation failed or fetch failed
+                         logger.critical(f"Failed to create AND retrieve new user for {from_number_clean}.")
+                         if send_whatsapp_message_available:
+                            await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
+                         return JSONResponse(content={}, status_code=status.HTTP_200_OK)
+
+
             except Exception as e:
                  logger.error(f"Failed to create new user for {from_number_clean}: {e}", exc_info=True)
                  if send_whatsapp_message_available:
@@ -676,9 +791,11 @@ async def whatsapp_webhook(request: Request):
              logger.error(f"Failed to update last_active for user {user_id}: {e}", exc_info=True)
 
         # --- 2. Find and Clean Up Potentially Multiple Pending Orders ---
+        # Find the most recent pending order
         latest_pending_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("payment_status", DefaultStatus.PAYMENT_UNPAID).not_.in_("status", [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
         active_pending_order = latest_pending_res.data[0] if latest_pending_res.data else None
 
+        # If a recent pending order exists, find and cancel any older ones
         if active_pending_order:
             latest_pending_created_at = active_pending_order['created_at']
             older_pending_res = supabase.table("orders").select("id").eq("user_id", user_id).eq("payment_status", DefaultStatus.PAYMENT_UNPAID).not_.in_("status", [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]).lt("created_at", latest_pending_created_at).execute()
@@ -687,12 +804,13 @@ async def whatsapp_webhook(request: Request):
                 older_order_ids = [o['id'] for o in older_pending_res.data]
                 logger.info(f"Cancelling {len(older_order_ids)} older pending orders for user {user_id}: {older_order_ids}")
                 try:
+                    # Use a single update statement for efficiency
                     supabase.table("orders").update({
                         "status": DefaultStatus.ORDER_CANCELLED,
                         "payment_status": DefaultStatus.PAYMENT_CANCELLED,
                         "cancelled_at": datetime.now().isoformat(),
                         "updated_at": datetime.now().isoformat(),
-                         "cancellation_reason": "superseded by newer pending order"
+                        "cancellation_reason": "superseded by newer pending order"
                     }).in_("id", older_order_ids).execute()
                     logger.info(f"Cancelled older pending orders: {older_order_ids}")
                 except Exception as e:
@@ -703,10 +821,13 @@ async def whatsapp_webhook(request: Request):
 
         # A. Handle incoming Location message if it's valid
         if is_location_message and latitude is not None and longitude is not None:
-             # Check if we are expecting a location for the active pending order
-             if active_pending_order and active_pending_order['status'] == DefaultStatus.ORDER_AWAITING_LOCATION:
-                 logger.info(f"Processing expected location for order {active_pending_order['id']} from user {user_id}")
-                 try:
+            # Check if we are expecting a location for the active pending order
+            if active_pending_order and active_pending_order['status'] in [DefaultStatus.ORDER_AWAITING_LOCATION, DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION]:
+                order_id = active_pending_order['id']
+                logger.info(f"Processing location for order {order_id} from user {user_id}. Current status: {active_pending_order['status']}")
+
+                try:
+                    # Save the received location regardless of whether it's new or confirming saved
                     location_to_save = json.dumps({"latitude": str(latitude), "longitude": str(longitude)})
                     supabase.table("users").update({"last_known_location": location_to_save}).eq("id", user_id).execute()
                     logger.info(f"Saved location {latitude},{longitude} for user {user_id}")
@@ -715,61 +836,36 @@ async def whatsapp_webhook(request: Request):
                     total_with_delivery = active_pending_order['total_amount'] + delivery_fee
 
                     update_data = {
-                        "status": DefaultStatus.ORDER_PENDING_PAYMENT,
-                        "delivery_type": "delivery",
+                        "status": DefaultStatus.ORDER_PENDING_PAYMENT, # Move to payment stage
+                        "delivery_type": "delivery", # Confirm delivery type
                         "delivery_fee": delivery_fee,
                         "total_with_delivery": total_with_delivery,
                         "delivery_location_lat": latitude,
                         "delivery_location_lon": longitude,
                         "updated_at": datetime.now().isoformat()
                     }
-                    supabase.table("orders").update(update_data).eq("id", active_pending_order['id']).execute()
-                    logger.info(f"Updated order {active_pending_order['id']} with delivery details and status {DefaultStatus.ORDER_PENDING_PAYMENT}")
+                    supabase.table("orders").update(update_data).eq("id", order_id).execute()
+                    logger.info(f"Updated order {order_id} with delivery details and status {DefaultStatus.ORDER_PENDING_PAYMENT}")
 
-                    payment_link = await generate_paystack_payment_link(active_pending_order['id'], total_with_delivery, from_number_clean)
+                    payment_link = await generate_paystack_payment_link(order_id, total_with_delivery, from_number_clean)
+
+                    # Add a note if the location was saved/updated
+                    location_note = "Using the location you shared."
+                    if active_pending_order['status'] == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
+                         location_note = "Using the new location you shared." # Clarify if they were confirming
+
                     reply_message = (
-                        f"Great, location received! Your delivery fee is GHS {delivery_fee:.2f}.\n\n"
+                        f"{location_note} Your delivery fee is GHS {delivery_fee:.2f}.\n\n"
                         f"Your new total is *GHS {total_with_delivery:.2f}*.\n\n"
-                        f"Please complete your payment here to confirm your order:\n{payment_link}"
+                        f"Please complete your payment here to confirm your order:\n{payment_link}\n\n"
+                        "Or reply 'cancel' to cancel the order."
                     )
-                 except Exception as e:
-                     logger.error(f"Error processing location or finalizing order for user {user_id}, order {active_pending_order['id']}: {e}", exc_info=True)
+                except Exception as e:
+                     logger.error(f"Error processing location or finalizing order for user {user_id}, order {order_id}: {e}", exc_info=True)
                      reply_message = f"Sorry, I encountered an issue processing your delivery details. Please try again or contact support."
 
-             elif active_pending_order and active_pending_order['status'] == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
-                  logger.info(f"User {user_id} sent location while order {active_pending_order['id']} is {DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION}. Treating as 'provide new'.")
-                  try:
-                    location_to_save = json.dumps({"latitude": str(latitude), "longitude": str(longitude)})
-                    supabase.table("users").update({"last_known_location": location_to_save}).eq("id", user_id).execute()
-                    logger.info(f"Saved NEW location {latitude},{longitude} for user {user_id}")
-
-                    delivery_fee = calculate_delivery_fee(latitude, longitude)
-                    total_with_delivery = active_pending_order['total_amount'] + delivery_fee
-
-                    update_data = {
-                        "status": DefaultStatus.ORDER_PENDING_PAYMENT,
-                        "delivery_type": "delivery",
-                        "delivery_fee": delivery_fee,
-                        "total_with_delivery": total_with_delivery,
-                        "delivery_location_lat": latitude,
-                        "delivery_location_lon": longitude,
-                        "updated_at": datetime.now().isoformat()
-                    }
-                    supabase.table("orders").update(update_data).eq("id", active_pending_order['id']).execute()
-                    logger.info(f"Updated order {active_pending_order['id']} with NEW delivery details and status {DefaultStatus.ORDER_PENDING_PAYMENT}")
-
-                    payment_link = await generate_paystack_payment_link(active_pending_order['id'], total_with_delivery, from_number_clean)
-                    reply_message = (
-                        f"Okay, using the new location you shared. The delivery fee is GHS {delivery_fee:.2f}.\n\n"
-                        f"Your new total is *GHS {total_with_delivery:.2f}*.\n\n"
-                        f"Please complete your payment here:\n{payment_link}"
-                    )
-                  except Exception as e:
-                     logger.error(f"Error processing NEW location or finalizing order for user {user_id}, order {active_pending_order['id']} (from confirmation stage): {e}", exc_info=True)
-                     reply_message = f"Sorry, I encountered an issue processing your delivery details. Please try again or contact support."
-
-             else:
-                 # User sent a location when we weren't expecting one
+            else:
+                 # User sent a location when we weren't expecting one or no pending order exists
                  logger.info(f"Received unexpected location message from user {user_id}. No pending order or not awaiting location.")
                  reply_message = "Thanks for sharing your location! I've saved it for future delivery orders, but I wasn't expecting it right now. How else can I help you today?"
 
@@ -782,31 +878,36 @@ async def whatsapp_webhook(request: Request):
         elif incoming_msg:
             lower_incoming_msg = incoming_msg.lower().strip()
             handled_by_pending_state = False
+            order_id = active_pending_order['id'] if active_pending_order else None
+            current_status: Optional[OrderStatus] = active_pending_order.get('status') if active_pending_order else None
 
             if active_pending_order:
-                order_id = active_pending_order['id']
-                current_status: OrderStatus = active_pending_order.get('status', DefaultStatus.ORDER_PENDING_CONFIRMATION)
-                logger.info(f"Handling pending order {order_id} (status: {current_status}) text input: '{incoming_msg}'")
+                logger.info(f"Handling text message for pending order {order_id} (status: {current_status}): '{incoming_msg}'")
 
                 # --- Check for specific commands within the current pending state ---
                 if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
                      if lower_incoming_msg in ["1", "delivery"]:
                          handled_by_pending_state = True
+                         # User selected Delivery. Check if they have a saved location.
                          if user.get("last_known_location"):
+                             # User has a saved location, ask if they want to use it
                              try:
+                                # Update status to await confirmation for saved location
                                 supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
                                 logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION}")
                                 reply_message = (
                                     "I see you have a saved delivery location with us. Would you like to use it for this order?\n\n"
                                     "Reply *1* to use saved location\n"
-                                    "Reply *2* to provide a new one\n\n"
+                                    "Reply *2* to provide a new one (you'll share it via WhatsApp location feature)\n\n"
                                     "Or reply 'cancel'."
                                 )
                              except Exception as e:
                                   logger.error(f"Failed to update order status for location confirmation {order_id}: {e}", exc_info=True)
                                   reply_message = "Sorry, I had trouble updating your order details. Please try again or reply 'cancel'."
                          else:
+                             # User has no saved location, ask them to share it
                              try:
+                                # Update status to await location sharing
                                 supabase.table("orders").update({"delivery_type": "delivery", "status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
                                 logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_AWAITING_LOCATION}")
                                 reply_message = (
@@ -821,8 +922,11 @@ async def whatsapp_webhook(request: Request):
                      elif lower_incoming_msg in ["2", "pickup"]:
                           handled_by_pending_state = True
                           try:
+                            # Update status to pending payment for pickup
                             supabase.table("orders").update({"delivery_type": "pickup", "status": DefaultStatus.ORDER_PENDING_PAYMENT, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_PENDING_PAYMENT} (pickup)")
+
+                            # Generate payment link for the original total amount
                             payment_link = await generate_paystack_payment_link(order_id, active_pending_order['total_amount'], from_number_clean)
                             reply_message = (
                                 f"Alright, your order is set for pickup.\n\n"
@@ -838,9 +942,13 @@ async def whatsapp_webhook(request: Request):
                     if lower_incoming_msg == "1": # Use saved location
                         handled_by_pending_state = True
                         location_str = user.get("last_known_location")
+
                         if not location_str:
+                            # This case should ideally not happen if the user was prompted based on having a saved location,
+                            # but handle defensively.
                             logger.warning(f"User {user_id} replied '1' to location confirmation but had no saved location. Order {order_id}")
                             try:
+                                # Revert status to awaiting location sharing
                                 supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
                                 reply_message = (
                                     "It seems your saved location wasn't available.\n\n"
@@ -852,14 +960,17 @@ async def whatsapp_webhook(request: Request):
                                 logger.error(f"Failed to update status to awaiting location after missing saved loc {order_id}: {e}", exc_info=True)
                                 reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
                         else:
+                            # Saved location exists, use it to finalize the order
                             try:
                                 location_data = json.loads(location_str)
                                 latitude = float(location_data.get("latitude"))
                                 longitude = float(location_data.get("longitude"))
 
+                                # Calculate fee and total with delivery for the saved location
                                 delivery_fee = calculate_delivery_fee(latitude, longitude)
                                 total_with_delivery = active_pending_order['total_amount'] + delivery_fee
 
+                                # Update order with delivery details and move to pending payment
                                 update_data = {
                                     "status": DefaultStatus.ORDER_PENDING_PAYMENT,
                                     "delivery_type": "delivery",
@@ -872,6 +983,7 @@ async def whatsapp_webhook(request: Request):
                                 supabase.table("orders").update(update_data).eq("id", order_id).execute()
                                 logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_PENDING_PAYMENT} using saved location.")
 
+                                # Generate payment link for the total including delivery fee
                                 payment_link = await generate_paystack_payment_link(order_id, total_with_delivery, from_number_clean)
                                 reply_message = (
                                     f"Using your saved location. The delivery fee is GHS {delivery_fee:.2f}.\n\n"
@@ -880,8 +992,10 @@ async def whatsapp_webhook(request: Request):
                                     "Or reply 'cancel'."
                                 )
                             except (ValueError, TypeError, json.JSONDecodeError) as e:
+                                # Handle errors if the saved location data is invalid or fee calculation fails
                                 logger.error(f"Invalid saved location data or fee processing error for user {user_id}: {location_str}. Error: {e}", exc_info=True)
                                 try:
+                                    # Revert status to awaiting location sharing if saved data was bad
                                     supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
                                     reply_message = (
                                         "It seems there was an issue with your saved location data.\n\n"
@@ -894,12 +1008,14 @@ async def whatsapp_webhook(request: Request):
                                      reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
 
                             except Exception as e:
+                                # Catch other errors during the finalization process
                                 logger.error(f"Error finalizing order {order_id} after using saved location for user {user_id}: {e}", exc_info=True)
                                 reply_message = f"Sorry, I encountered an issue processing your delivery details. Please try again or reply 'cancel'."
 
                     elif lower_incoming_msg == "2": # Provide a new one
                         handled_by_pending_state = True
                         try:
+                            # Update status to await location sharing
                             supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_AWAITING_LOCATION} (user providing new)")
                             reply_message = (
@@ -913,17 +1029,20 @@ async def whatsapp_webhook(request: Request):
                             reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
 
                 # --- Handle Cancel Command ---
+                # Check for 'cancel' regardless of other state-specific inputs
                 if lower_incoming_msg == 'cancel':
-                    handled_by_pending_state = True
+                    handled_by_pending_state = True # Mark as handled
                     if current_status in [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]:
-                         reply_message = f"This order (ID: {order_id}) is already marked as *{current_status}* and cannot be cancelled."
+                         reply_message = f"This order (ID: {order_id}) is already marked as *{current_status.replace('_', ' ').title()}* and cannot be cancelled."
                     else:
                          try:
+                            # Update order status to cancelled
                             supabase.table("orders").update({
                                 "status": DefaultStatus.ORDER_CANCELLED,
-                                "payment_status": DefaultStatus.PAYMENT_CANCELLED,
+                                "payment_status": DefaultStatus.PAYMENT_CANCELLED, # Also mark payment as cancelled
                                 "cancelled_at": datetime.now().isoformat(),
-                                "updated_at": datetime.now().isoformat()
+                                "updated_at": datetime.now().isoformat(),
+                                "cancellation_reason": "user requested cancellation"
                             }).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} successfully cancelled by user {user_id}.")
                             reply_message = f"Your order (ID: {order_id}) has been cancelled. Please let me know if there's anything else I can help with."
@@ -933,13 +1052,14 @@ async def whatsapp_webhook(request: Request):
 
 
                 # --- Handle messages that are *not* state-specific commands ---
+                # If the message wasn't a state-specific command (like 1, 2, cancel)
                 if not handled_by_pending_state:
-                    user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
+                    user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))} # Context might be useful for Gemini
                     gemini_result = await get_intent_gracefully(incoming_msg, user_context)
                     intent = gemini_result.get('intent')
                     ai_ack = gemini_result.get('response', 'Okay.')
 
-                    # Default reminder message based on current pending status
+                    # Construct a reminder message based on the current pending status
                     reminder_message = ""
                     if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
                          reminder_message = "\n\nBut please first choose '1' for Delivery or '2' for Pickup for your pending order."
@@ -949,44 +1069,44 @@ async def whatsapp_webhook(request: Request):
                          reminder_message = "\n\nBut I'm still waiting for your delivery location for your pending order. Please share it using the location feature."
                     elif current_status == DefaultStatus.ORDER_PENDING_PAYMENT:
                          total = active_pending_order.get('total_with_delivery') or active_pending_order['total_amount']
+                         total_formatted = f"{total:.2f}" if total is not None else "N/A"
                          try:
+                             # Attempt to re-generate the payment link for the reminder
                              payment_link = await generate_paystack_payment_link(order_id, total, from_number_clean)
                              reminder_message = (
-                                 f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment (GHS {total:.2f}). Please pay here: {payment_link}\n"
+                                 f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment (GHS {total_formatted}). Please pay here: {payment_link}\n"
                                  "Or reply 'cancel'."
                              )
                          except Exception as e:
                               logger.error(f"Failed to re-generate payment link for reminder for order {order_id}: {e}", exc_info=True)
+                              # Provide a fallback reminder if link generation fails
                               reminder_message = f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment. Please reply 'cancel' if you don't want to proceed."
 
+                    # Combine the AI acknowledgement with the reminder message
+                    reply_message = f"{ai_ack}{reminder_message}"
 
-                    if intent in ["greet", "thank_you", "help", "repeat"]:
-                         reply_message = ai_ack + reminder_message
-                    elif intent in ["buy", "check_status"]:
-                         action_needed = ""
-                         if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION: action_needed = "choose delivery/pickup"
-                         elif current_status in [DefaultStatus.ORDER_AWAITING_LOCATION, DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION]: action_needed = "provide delivery location"
-                         elif current_status == DefaultStatus.ORDER_PENDING_PAYMENT: action_needed = "make payment"
+                    # Log the intent even if it wasn't a specific command
+                    logger.info(f"Text message for pending order {order_id} not handled by state command. Intent: '{intent}'. Reply: '{reply_message}'")
 
-                         if action_needed:
-                              reply_message = f"{ai_ack} However, you currently have a pending order (ID: {order_id}) waiting for you to {action_needed}. Please complete that step first, or reply 'cancel'."
-                         else:
-                              reply_message = f"{ai_ack} However, you have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
-
-                    else:
-                         reply_message = f"I'm not sure how to help with that right now. You currently have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
-                         if reminder_message:
-                              reply_message += reminder_message
+                # else: # This else block was misplaced and caused issues. Removed.
+                #    reply_message = f"I'm not sure how to help with that right now. You currently have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
 
 
+            # --- Handle incoming Text Message when NO active pending order exists ---
             else: # No active pending order
-                user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
+                logger.info(f"Handling text message for user {user_id} with no active pending order: '{incoming_msg}'")
+                # Determine intent for a new conversation
+                user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))} # Provide relevant user context
                 gemini_result = await get_intent_gracefully(incoming_msg, user_context)
-                # Passing incoming_msg to handle_new_conversation for logging/context
+                # Call handle_new_conversation to get the appropriate response based on intent
                 reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg)
 
-        else:
+
+        # D. Handle empty or unhandled message type (if no text, location, or media was processed)
+        # This block executes if none of the specific message type handlers above set a reply_message
+        if not reply_message:
              logger.info(f"Received an empty or unhandled message type from user {user_id}.")
+             # Provide a default welcome or help message
              if is_new_user:
                  reply_message = "👋 Welcome to Fresh Market GH!\n\nI can help you order fresh groceries.\n\nTo start, just say 'I want to buy...' or 'Show me the menu'."
              else:
@@ -996,6 +1116,7 @@ async def whatsapp_webhook(request: Request):
 
 
         # --- 4. Send the determined reply message and update last_bot_message ---
+        # Only attempt to send if there is a reply message AND the utility is available
         if reply_message and send_whatsapp_message_available:
              try:
                 await send_whatsapp_message(from_number_clean, reply_message)
@@ -1004,28 +1125,36 @@ async def whatsapp_webhook(request: Request):
                     # Save the sent message as last_bot_message for 'repeat' intent
                     # Limit length to avoid excessive storage
                     truncated_message = reply_message[:1000] # Limit to first 1000 chars
+                    # Use upsert or a check if needed, but simple update is fine for last message
                     supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
                     logger.info(f"Saved last bot message for user {user_id}.");
                 except Exception as e:
                      logger.error(f"Failed to save last bot message for user {user_id}: {e}", exc_info=True);
 
              except Exception as send_e:
+                # Log sending failure, but don't re-raise as webhook must return 200 OK
                 logger.error(f"Failed to send WhatsApp message to {from_number_clean}: {send_e}", exc_info=True)
 
         elif reply_message and not send_whatsapp_message_available:
+            # Log that message couldn't be sent due to utility not being available
             logger.error(f"send_whatsapp_message is not available. Cannot send reply to {from_number_clean}: {reply_message}")
+
+        # Webhook must always return 200 OK quickly
+        return JSONResponse(content={}, status_code=status.HTTP_200_OK)
 
 
     except Exception as e:
-        # This catch-all should now only be for truly unexpected errors outside the AI call handling
+        # This catch-all should now only be for truly unexpected errors outside the specific handlers
         logger.error(f"Unhandled critical error in whatsapp_webhook for user {from_number_clean}: {e}", exc_info=True)
-        if not reply_message and from_number_clean and send_whatsapp_message_available:
+        # Attempt to send an emergency error message if possible and no reply was set
+        if not reply_message and from_number_clean != "unknown" and send_whatsapp_message_available:
              try:
                 await send_whatsapp_message(from_number_clean, "Oh, something went wrong on my end. Please try again in a moment.")
              except Exception as send_e_2:
                  logger.error(f"Failed to send emergency error message to {from_number_clean}: {send_e_2}", exc_info=True)
 
-    return JSONResponse(content={}, status_code=status.HTTP_200_OK)
+        # Always return 200 OK to the webhook provider
+        return JSONResponse(content={}, status_code=status.HTTP_200_OK)
 
 
 # --- Frontend/API Endpoints ---
@@ -1037,12 +1166,18 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
     Endpoint for the frontend/web menu to confirm items selected by the user.
     Requires API key authentication from the frontend.
     """
+    # Ensure Supabase and security are available
     if not supabase:
         logger.error("/confirm-items called but Supabase client is not available.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database connection not available")
+    if not security:
+         logger.error("/confirm-items called but security module is not available.")
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Security module not available")
+
 
     try:
-        session_res = supabase.table("sessions").select("user_id, phone_number").eq("session_token", request.session_token).limit(1).execute()
+        # 1. Validate Session
+        session_res = supabase.table("sessions").select("user_id, phone_number, expires_at").eq("session_token", request.session_token).limit(1).execute()
 
         if not session_res.data:
             logger.warning(f"Session token {request.session_token} not found or expired for confirm-items.")
@@ -1051,8 +1186,30 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
         session_data = session_res.data[0]
         user_id = session_data["user_id"]
         phone_number = session_data["phone_number"]
-        logger.info(f"Session {request.session_token} found for user {user_id} ({phone_number})")
+        expires_at_str = session_data["expires_at"]
 
+        # Explicitly check session expiry
+        try:
+            expires_at = datetime.fromisoformat(expires_at_str)
+            if datetime.now() > expires_at:
+                 logger.warning(f"Session token {request.session_token} expired for user {user_id}.")
+                 # Delete the expired session proactively
+                 try:
+                    supabase.table("sessions").delete().eq("session_token", request.session_token).execute()
+                    logger.info(f"Deleted expired session token {request.session_token}.")
+                 except Exception as e:
+                     logger.error(f"Failed to delete expired session {request.session_token}: {e}", exc_info=True)
+
+                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session expired.")
+        except ValueError:
+             logger.error(f"Could not parse expires_at for session {request.session_token}: {expires_at_str}", exc_info=True)
+             # Treat as invalid/expired if date parsing fails
+             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid session data.")
+
+
+        logger.info(f"Session {request.session_token} found and valid for user {user_id} ({phone_number})")
+
+        # 2. Cancel any existing pending unpaid orders for this user
         logger.info(f"Cancelling any existing pending unpaid orders for user_id: {user_id} before creating new one from session {request.session_token}.")
         try:
             supabase.table("orders").update({
@@ -1067,53 +1224,58 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
             logger.error(f"Failed to cancel old pending orders for user {user_id} during confirm-items: {e}", exc_info=True)
 
 
-        items_dict = [item.model_dump() for item in request.items]
+        # 3. Create the new order
+        items_dict = [item.model_dump() for item in request.items] # Use model_dump() for Pydantic v2+
 
         order_data = {
             "user_id": user_id,
             "items_json": items_dict,
             "total_amount": request.total_amount,
-            "status": DefaultStatus.ORDER_PENDING_CONFIRMATION,
+            "status": DefaultStatus.ORDER_PENDING_CONFIRMATION, # Initial status
             "payment_status": DefaultStatus.PAYMENT_UNPAID,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat()
         }
 
         try:
-            # CORRECTED: Removed .select("id") from the insert query
+            # CORRECTED: Removed .select("id") from the insert query - execute() might still return data depending on version
             result = supabase.table("orders").insert(order_data).execute()
             # Assuming execute() on insert returns data in this client version
             if not result.data:
                 logger.error(f"Supabase insert returned no data for new order for user {user_id}.")
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create new order in database.")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create new order in database (no data returned).")
 
             order_id = result.data[0]["id"]
             logger.info(f"Created new order {order_id} for user {user_id} from session {request.session_token}")
 
         except Exception as e:
             logger.error(f"Failed to insert new order for user {user_id}: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create new order in database: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create new order in database.")
 
 
+        # 4. Delete the session token
         try:
             supabase.table("sessions").delete().eq("session_token", request.session_token).execute()
             logger.info(f"Deleted session token {request.session_token} after order creation.")
         except Exception as e:
-             logger.error(f"Failed to delete session token {request.session_token}: {e}", exc_info=True)
+             logger.error(f"Failed to delete session token {request.session_token}: {e}", exc_info=True) # Log error, but don't fail the request
 
 
+        # 5. Notify user via WhatsApp with next steps
         delivery_msg = (
             "Thank you for confirming your items!\n\n"
             f"Your order total is *GHS {request.total_amount:.2f}* (excluding delivery).\n\n"
             "Please tell me how you'd like to receive your order by replying with the number:\n\n"
             f"*1* for Delivery (I'll ask for your location to calculate the fee).\n"
-            f"*2* for Pickup (no delivery fee)."
+            f"*2* for Pickup (no delivery fee).\n\n"
+            "Or reply 'cancel' to cancel the order."
         )
         if send_whatsapp_message_available:
             try:
                 await send_whatsapp_message(phone_number, delivery_msg)
                 logger.info(f"Sent confirmation message to user {user_id} ({phone_number}) for order {order_id}")
                 try:
+                    # Save the sent message as last_bot_message
                     truncated_message = delivery_msg[:1000]
                     supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
                     logger.info(f"Saved last bot message for user {user_id} from /confirm-items.");
@@ -1122,16 +1284,19 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
 
             except Exception as e:
                 logger.error(f"Failed to send WhatsApp confirmation message to {phone_number} for order {order_id}: {e}", exc_info=True)
+                # This is a non-critical failure for the API endpoint, just log it.
         else:
             logger.error(f"send_whatsapp_message is not available. Cannot send confirmation for order {order_id} to {phone_number}")
 
-        return {"status": "order saved", "order_id": order_id}
+        return {"status": "order saved", "order_id": order_id, "next_step_message_sent": send_whatsapp_message_available}
 
     except HTTPException:
+        # Re-raise HTTPException so FastAPI handles it
         raise
     except Exception as e:
+        # Catch any other unexpected errors
         logger.error(f"/confirm-items endpoint unexpected error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred.") # Generic error for user
 
 
 @app.post("/payment-success")
@@ -1143,6 +1308,13 @@ async def payment_success_webhook(request: Request):
     Also handles other Paystack events like 'charge.failed' if necessary.
     """
     logger.info("Received Paystack webhook call.")
+
+    # Ensure Supabase is available early for database operations
+    if not supabase:
+        logger.error("Supabase client not available for payment-success webhook processing.")
+        # Return 200 OK to Paystack, but signal internal error
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Internal database unavailable"})
+
 
     signature = request.headers.get("x-paystack-signature")
     if not signature:
@@ -1156,10 +1328,12 @@ async def payment_success_webhook(request: Request):
         return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Failed to read request body"})
 
     if not verify_paystack_signature(request_body, signature, settings.PAYSTACK_SECRET_KEY):
+        # verification failed, return 200 OK to Paystack but log warning
         logger.warning("Paystack webhook signature verification failed.")
         return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Invalid signature"})
 
     try:
+        # Parse the JSON body now that signature is verified
         data = json.loads(request_body)
         event_type = data.get("event")
         paystack_reference = data.get("data", {}).get("reference")
@@ -1167,121 +1341,179 @@ async def payment_success_webhook(request: Request):
         paystack_gateway_response = data.get("data", {}).get("gateway_response")
         paystack_amount_kobo = data.get("data", {}).get("amount")
         order_id = data.get("data", {}).get("metadata", {}).get("order_id")
+        # Also capture the reference from metadata if it was included (good practice)
+        metadata_reference = data.get("data", {}).get("metadata", {}).get("reference")
+        # Use the reference from data if available, fallback to metadata
+        final_reference = paystack_reference or metadata_reference
 
-        logger.info(f"Processing Paystack event '{event_type}' for reference '{paystack_reference}' (Paystack status: {paystack_status}). Order ID: {order_id}")
+
+        logger.info(f"Processing Paystack event '{event_type}' for reference '{final_reference}' (Paystack status: {paystack_status}). Order ID: {order_id}")
 
         if not order_id:
-            logger.error(f"Paystack webhook event '{event_type}' received without order_id in metadata. Reference: {paystack_reference}")
+            logger.error(f"Paystack webhook event '{event_type}' received without order_id in metadata. Reference: {final_reference}")
             return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "order_id not found in metadata"})
 
-        if not supabase:
-            logger.error("Supabase client not available for payment-success webhook processing.")
-            return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Database connection unavailable"})
 
+        # Fetch the order from the database
         order_res = supabase.table("orders").select("id, user_id, payment_status, status, total_amount, total_with_delivery, delivery_type").eq("id", order_id).limit(1).execute()
 
         if not order_res.data:
-            logger.warning(f"Paystack webhook: No order found in DB for order_id {order_id} (Paystack ref: {paystack_reference}).")
+            logger.warning(f"Paystack webhook: No order found in DB for order_id {order_id} (Paystack ref: {final_reference}).")
             return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Order not found in internal database."})
 
         order = order_res.data[0]
         current_payment_status: PaymentStatus = order.get("payment_status", DefaultStatus.PAYMENT_UNPAID)
-        current_order_status: OrderStatus = order.get("status", DefaultStatus.ORDER_PENDING_PAYMENT)
+        current_order_status: OrderStatus = order.get("status", DefaultStatus.ORDER_PENDING_PAYMENT) # Assume pending payment if status is null
 
-        expected_total_kobo = int((order.get('total_with_delivery') or order.get('total_amount')) * 100)
+        # Determine the expected total amount (use total_with_delivery if available, otherwise total_amount)
+        expected_total = order.get('total_with_delivery') or order.get('total_amount')
+        if expected_total is None:
+             logger.error(f"Order {order_id} has no total_amount or total_with_delivery. Cannot process payment webhook.")
+             return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Order data missing total amount."})
+        expected_total_kobo = int(expected_total * 100)
+
 
         update_needed = False
+        # Prepare base update data, include reference and amount received
         update_data: Dict[str, Any] = {
-             "paystack_reference": paystack_reference,
-             "amount_paid_kobo": paystack_amount_kobo,
-             "updated_at": datetime.now().isoformat()
+             "paystack_reference": final_reference,
+             "amount_paid_kobo": paystack_amount_kobo, # Store the amount received
+            "updated_at": datetime.now().isoformat(),
+             "paystack_status": paystack_status, # Store paystack's status
+             "paystack_gateway_response": paystack_gateway_response # Store gateway response
         }
-        notification_prefix = "ℹ️ Order Update"
-        notification_suffix = ""
+
+        # Initialize variables for potential new statuses and notification message parts
         new_payment_status = current_payment_status
         new_order_status = current_order_status
-
+        notification_prefix = "ℹ️ Order Update"
+        notification_suffix = ""
+        notification_needed = False # Flag to control sending WhatsApp message
 
         # --- Process specific event types ---
         if event_type == "charge.success":
+            notification_needed = True # Always notify on success/failure
             if paystack_status == 'success':
+                 # Check if the amount received meets or exceeds the expected total
                  if paystack_amount_kobo is not None and paystack_amount_kobo >= expected_total_kobo:
                      if current_payment_status != DefaultStatus.PAYMENT_PAID:
                          new_payment_status = DefaultStatus.PAYMENT_PAID
-                         new_order_status = DefaultStatus.ORDER_PROCESSING
+                         # If moving to PAID, the order is now ready for processing
+                         # Only move to PROCESSING if it was in a payment-related state
+                         if current_order_status in [DefaultStatus.ORDER_PENDING_PAYMENT, DefaultStatus.ORDER_AWAITING_LOCATION, DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION, DefaultStatus.ORDER_PENDING_CONFIRMATION]:
+                             new_order_status = DefaultStatus.ORDER_PROCESSING
+
                          update_needed = True
                          notification_prefix = "✅ Payment confirmed!"
-                         notification_suffix = " We are now preparing your items."
-                         logger.info(f"Order {order_id}: Full payment success.")
+                         notification_suffix = " Your order is now being processed."
+                         logger.info(f"Order {order_id}: Full payment success. Status updated to PAID/PROCESSING.")
                      else:
-                         logger.info(f"Order {order_id}: Already marked PAID, skipping update.")
-                         return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "success", "message": "Order already processed"})
+                         logger.info(f"Order {order_id}: Already marked PAID. Received duplicate 'charge.success' webhook?")
+                         notification_needed = False # Don't send redundant notification
 
-                 elif paystack_amount_kobo is not None and paystack_amount_kobo > 0: # Partial payment
+                 # Check for partial payment if amount is less than expected but positive
+                 elif paystack_amount_kobo is not None and paystack_amount_kobo > 0 and paystack_amount_kobo < expected_total_kobo:
                      if current_payment_status not in [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]:
                          new_payment_status = DefaultStatus.PAYMENT_PARTIALLY_PAID
+                         # Keep order status as PENDING_PAYMENT or current unless it was failed/cancelled
+                         if current_order_status in [DefaultStatus.ORDER_FAILED, DefaultStatus.ORDER_CANCELLED]:
+                              # If it was failed/cancelled, perhaps move to pending payment if partial is allowed?
+                              # Decide on your policy for partial payments on failed/cancelled orders.
+                              # For now, let's assume partial payment on a failed/cancelled order doesn't automatically 'un-fail'/'un-cancel' it.
+                              pass # Status remains failed/cancelled
+                         # If it was pending payment, it remains pending payment
+                         elif current_order_status != DefaultStatus.ORDER_PENDING_PAYMENT:
+                              # This state transition might be unexpected, log it
+                              logger.warning(f"Order {order_id} received partial payment (GHS {(paystack_amount_kobo/100):.2f}) but status was '{current_order_status}'.")
+                              # Keep current status unless it implies paid (e.g., PROCESSING)
+                              if current_order_status not in [DefaultStatus.ORDER_PROCESSING, DefaultStatus.ORDER_OUT_FOR_DELIVERY, DefaultStatus.ORDER_DELIVERED]:
+                                  new_order_status = DefaultStatus.ORDER_PENDING_PAYMENT # Revert to pending payment if status implies processing/delivery but only partial paid
+
                          update_needed = True
                          notification_prefix = "⚠️ Partial Payment Confirmed!"
                          notification_suffix = f" Received GHS {(paystack_amount_kobo/100):.2f} of GHS {(expected_total_kobo/100):.2f}. Please contact support to complete the remaining payment."
                          logger.warning(f"Order {order_id}: Partial payment received.")
                      else:
-                          logger.info(f"Order {order_id}: Already marked {current_payment_status}, skipping partial payment update.")
-                          return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "success", "message": "Order already processed"})
+                          logger.info(f"Order {order_id}: Already marked {current_payment_status}. Received duplicate 'charge.success' webhook with partial amount?")
+                          notification_needed = False # Don't send redundant notification
                  else:
-                      logger.error(f"Paystack charge.success event with amount_kobo={paystack_amount_kobo} for order {order_id}.")
+                      # Amount received was zero or negative, which is unexpected for charge.success
+                      logger.error(f"Paystack charge.success event with invalid amount_kobo={paystack_amount_kobo} for order {order_id}. Expected >= {expected_total_kobo}.")
                       notification_prefix = "❌ Payment Issue"
                       notification_suffix = " There was an issue with the payment amount received. Please contact support."
+                      # Do not change payment status unless you have a specific "invalid_amount" status
 
-            elif paystack_status == 'failed':
-                 if current_payment_status not in [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID, DefaultStatus.PAYMENT_FAILED]:
+            elif paystack_status in ['failed', 'reversed', 'chargeback']:
+                 # Handle failure/reversals
+                 if current_payment_status not in [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID, DefaultStatus.PAYMENT_FAILED, DefaultStatus.PAYMENT_CANCELLED]:
+                     # Only update if the current status isn't already a final state or paid/partially paid
                      new_payment_status = DefaultStatus.PAYMENT_FAILED
-                     new_order_status = DefaultStatus.ORDER_FAILED
+                     new_order_status = DefaultStatus.ORDER_FAILED # Also mark the order as failed
                      update_needed = True
                      notification_prefix = "❌ Payment Failed"
-                     notification_suffix = " Please try again or contact support if the amount was deducted."
+                     notification_suffix = " There was an issue processing your payment. Please try again or contact support if the amount was deducted."
                      logger.info(f"Order {order_id}: Payment explicitly failed according to Paystack.")
                  else:
-                      logger.info(f"Order {order_id}: Payment already marked {current_payment_status}, ignoring 'failed' status from Paystack.")
-                      return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "success", "message": "Order already processed"})
+                      logger.info(f"Order {order_id}: Payment already marked {current_payment_status}, ignoring '{paystack_status}' status from Paystack.")
+                      notification_needed = False # Don't send notification if already processed
+
+            elif paystack_status in ['abandoned']:
+                 # Handle abandoned payments if needed
+                 logger.info(f"Paystack charge.success event with status 'abandoned' for order {order_id}. No status change needed.")
+                 notification_needed = False # Usually no notification needed for abandoned state via webhook
+
             else:
-                 logger.warning(f"Paystack charge.success event with unexpected status '{paystack_status}' for order {order_id}.")
+                 logger.warning(f"Paystack charge.success event with unexpected status '{paystack_status}' for order {order_id}. Gateway Response: {paystack_gateway_response}")
+                 # Decide if you want to notify on unexpected statuses. Maybe log and ignore.
+                 notification_needed = False
 
-
-        # Add handling for other events if they are relevant
+        # Add handling for other relevant events Paystack sends
+        # elif event_type == "transfer.success": ... # If you pay vendors via Paystack
         # elif event_type == "charge.dispute.create": ...
-        # elif event_type == "transfer.success": ...
+        # elif event_type == "customeridentification.success": ... # If you use this feature
 
 
+        # --- Update the database if changes are needed ---
         if update_needed:
             update_data["payment_status"] = new_payment_status
+            # Only update order status if it's changing
             if new_order_status != current_order_status:
                  update_data["status"] = new_order_status
 
             try:
+                # Use eq("id", order_id) to ensure correct order is updated
+                # Consider adding eq("payment_status", current_payment_status) and eq("status", current_order_status)
+                # as optimistic concurrency control if race conditions are a concern.
                 supabase.table("orders").update(update_data).eq("id", order_id).execute()
                 logger.info(f"Order {order_id} successfully updated to payment_status '{new_payment_status}' and status '{new_order_status}'.")
             except Exception as e:
                 logger.error(f"Failed to update order {order_id} in DB after Paystack webhook processing: {e}", exc_info=True)
+                # Log error but still return 200 OK to Paystack
                 return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Failed to update order in database"})
         else:
              logger.info(f"No payment/order status update needed for order {order_id}. Event {event_type}, current payment {current_payment_status}, current order {current_order_status}.")
 
 
         # --- Notify User via WhatsApp ---
-        # Only send notification if update was needed OR if it was a failure event that needs reporting
-        if update_needed or (event_type == "charge.success" and paystack_status == 'failed'):
+        # Only send notification if it was deemed necessary based on the event and status changes
+        if notification_needed:
              user_query = supabase.table("users").select("phone_number").eq("id", order["user_id"]).limit(1).execute()
 
              if user_query.data and send_whatsapp_message_available:
                  phone_number = user_query.data[0]["phone_number"]
                  total_paid_display = (paystack_amount_kobo / 100.0) if paystack_amount_kobo is not None else "N/A"
+                 # Use the potentially updated statuses for the notification message
+                 status_display = new_order_status.replace('-', ' ').title()
+                 payment_status_display = new_payment_status.replace('_', ' ').title()
+
 
                  notification_message = (
                      f"{notification_prefix}\n\n"
                      f"Your Order ID is: {order_id}.\n"
-                     f"Amount: *GHS {total_paid_display:.2f}*.\n"
-                     f"Delivery Type: *{order.get('delivery_type', 'Not specified').title()}*.\n"
-                     f"Reference: {paystack_reference}\n\n"
+                     f"Amount Paid: *GHS {total_paid_display:.2f}*.\n"
+                     f"Current Order Status: *{status_display}*.\n"
+                     f"Payment Status: *{payment_status_display}*.\n"
+                     f"Reference: {final_reference}\n\n"
                      f"{notification_suffix}"
                  )
 
@@ -1289,33 +1521,38 @@ async def payment_success_webhook(request: Request):
                      await send_whatsapp_message(phone_number, notification_message)
                      logger.info(f"Notified user {order['user_id']} ({phone_number}) about order {order_id} payment status '{new_payment_status}'.")
                      try:
-                         supabase.table("users").update({"last_bot_message": notification_message}).eq("id", order['user_id']).execute();
+                         # Save the notification message
+                         truncated_message = notification_message[:1000]
+                         supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", order['user_id']).execute();
                          logger.info(f"Saved last bot message for user {order['user_id']} from /payment-success.");
                      except Exception as e:
                          logger.error(f"Failed to save last bot message for user {order['user_id']} from /payment-success: {e}", exc_info=True);
 
                  except Exception as e:
-                      logger.error(f"Failed to send WhatsApp notification for paid order {order_id} to {phone_number}: {e}", exc_info=True)
+                      logger.error(f"Failed to send WhatsApp notification for order {order_id} to {phone_number}: {e}", exc_info=True)
 
+             elif not user_query.data:
+                 logger.error(f"Could not find user {order['user_id']} to notify for order {order_id}")
              elif not send_whatsapp_message_available:
                  logger.error(f"send_whatsapp_message is not available. Cannot notify user {order['user_id']} about order {order_id}")
-             else:
-                 logger.error(f"Could not find user {order['user_id']} to notify for order {order_id}")
 
 
-        # Return 200 OK to Paystack
-        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "success", "message": f"Event {event_type} processed successfully"})
+        # Final step: Return 200 OK to Paystack regardless of processing success
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "success", "message": f"Event {event_type} processed"})
 
     except json.JSONDecodeError:
         logger.error("Paystack webhook received non-JSON body after signature verification.")
+        # Return 200 OK despite error, as per webhook best practices
         return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": "Invalid JSON body"})
     except Exception as e:
+        # Catch any other unexpected errors during payload processing
         logger.error(f"Unexpected error processing Paystack webhook payload for reference {paystack_reference}: {str(e)}", exc_info=True)
-        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": f"Internal server error during processing: {e}"})
+        # Return 200 OK despite error, as per webhook best practices
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "error", "message": f"Internal server error during processing."}) # Generic error message
 
 
 # Export the app for Vercel
-app.debug = False
+app.debug = False # Set debug to False for production
 
 @app.on_event("startup")
 async def startup_event():
@@ -1325,7 +1562,9 @@ async def startup_event():
     if not send_whatsapp_message_available:
          logger.error("send_whatsapp_message utility is not available. WhatsApp communication will be disabled.")
     if not settings.PAYSTACK_SECRET_KEY:
-         logger.warning("PAYSTACK_SECRET_KEY is not set. Payment link generation will use mock links, webhook verification will fail.")
+         logger.warning("PAYSTACK_SECRET_KEY is not set. Payment link generation will use mock links, webhook verification will FAIL.")
+    if not settings.GEMINI_API_KEY:
+         logger.warning("GEMINI_API_KEY is not set. AI intent analysis will use basic fallback logic.")
     # Add checks for other critical settings/connections
 
 @app.on_event("shutdown")
