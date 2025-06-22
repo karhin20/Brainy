@@ -1,4 +1,3 @@
-
 import os
 import sys
 import uuid
@@ -1229,7 +1228,7 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
 
         order_data = {
             "user_id": user_id,
-            "items_json": items_dict,
+            "items_json": json.dumps(items_dict),
             "total_amount": request.total_amount,
             "status": DefaultStatus.ORDER_PENDING_CONFIRMATION, # Initial status
             "payment_status": DefaultStatus.PAYMENT_UNPAID,
