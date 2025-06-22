@@ -1,5 +1,3 @@
-
-
 import os
 import sys
 import uuid
@@ -151,7 +149,7 @@ if admin_router:
 if auth_router:
     app.include_router(auth_router.router, prefix="/auth", tags=["auth"])
 if public_router:
-    app.include_router(public_router.router, prefix="/public", tags=["public"])
+    app.include_router(public_router.router)
 
 
 # --- Pydantic Models ---
@@ -1062,10 +1060,10 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
                 await send_whatsapp_message(phone_number, delivery_msg)
                 logger.info(f"Sent confirmation message to user {user_id} ({phone_number}) for order {order_id}")
                 try:
-                    supabase.table("users").update({"last_bot_message": delivery_msg}).eq("id", user_id).execute()
+                    supabase.table("users").update({"last_bot_message": delivery_msg}).eq("id", user_id).execute();
                     logger.info(f"Saved last bot message for user {user_id} from /confirm-items.")
                 except Exception as e:
-                     logger.error(f"Failed to save last bot message for user {user_id} from /confirm-items: {e}", exc_info=True)
+                     logger.error(f"Failed to save last bot message for user {user_id} from /confirm-items: {e}", exc_info=True);
 
             except Exception as e:
                 logger.error(f"Failed to send WhatsApp confirmation message to {phone_number} for order {order_id}: {e}", exc_info=True)
