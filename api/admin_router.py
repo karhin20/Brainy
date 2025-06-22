@@ -20,7 +20,6 @@ except ImportError:
 from .security import verify_jwt
 
 router = APIRouter(
-    prefix="/admin",
     tags=["Admin"],
     dependencies=[Depends(verify_jwt)]
 )
