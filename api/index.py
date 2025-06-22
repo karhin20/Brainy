@@ -1,3 +1,4 @@
+
 import os
 import sys
 import uuid
@@ -517,8 +518,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     else: # unknown or any other unhandled intent
         logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{original_message}')")
-        # **APPLIED TO UNKNOWN:** Returns AI's specific unknown response.
-        return ai_response_ack
+        return ai_response_ack # This should be "I'm sorry, I can only help with grocery orders."
 
 
 def calculate_delivery_fee(lat: float, lon: float) -> float:
@@ -611,7 +611,9 @@ async def whatsapp_webhook(request: Request):
         if not user:
             is_new_user = True
             try:
-                insert_res = supabase.table("users").insert({"phone_number": from_number_clean}).select("*").execute()
+                # CORRECTED: Removed .select("*") from the insert query
+                insert_res = supabase.table("users").insert({"phone_number": from_number_clean}).execute()
+                # Assuming execute() on insert returns data in this client version
                 user = insert_res.data[0]
                 logger.info(f"Created new user with id {user['id']} for phone {from_number_clean}")
             except Exception as e:
@@ -955,10 +957,10 @@ async def whatsapp_webhook(request: Request):
                     # Save the sent message as last_bot_message for 'repeat' intent
                     # Limit length to avoid excessive storage
                     truncated_message = reply_message[:1000] # Limit to first 1000 chars
-                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute()
-                    logger.info(f"Saved last bot message for user {user_id}.")
+                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
+                    logger.info(f"Saved last bot message for user {user_id}.");
                 except Exception as e:
-                     logger.error(f"Failed to save last bot message for user {user_id}: {e}", exc_info=True)
+                     logger.error(f"Failed to save last bot message for user {user_id}: {e}", exc_info=True);
 
              except Exception as send_e:
                 logger.error(f"Failed to send WhatsApp message to {from_number_clean}: {send_e}", exc_info=True)
@@ -1030,8 +1032,9 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
         }
 
         try:
-            result = supabase.table("orders").insert(order_data).select("id").execute()
-
+            # CORRECTED: Removed .select("id") from the insert query
+            result = supabase.table("orders").insert(order_data).execute()
+            # Assuming execute() on insert returns data in this client version
             if not result.data:
                 logger.error(f"Supabase insert returned no data for new order for user {user_id}.")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create new order in database.")
@@ -1063,12 +1066,11 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
                 await send_whatsapp_message(phone_number, delivery_msg)
                 logger.info(f"Sent confirmation message to user {user_id} ({phone_number}) for order {order_id}")
                 try:
-                    # Save the sent message as last_bot_message
                     truncated_message = delivery_msg[:1000]
-                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute()
-                    logger.info(f"Saved last bot message for user {user_id} from /confirm-items.")
+                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
+                    logger.info(f"Saved last bot message for user {user_id} from /confirm-items.");
                 except Exception as e:
-                     logger.error(f"Failed to save last bot message for user {user_id} from /confirm-items: {e}", exc_info=True)
+                     logger.error(f"Failed to save last bot message for user {user_id} from /confirm-items: {e}", exc_info=True);
 
             except Exception as e:
                 logger.error(f"Failed to send WhatsApp confirmation message to {phone_number} for order {order_id}: {e}", exc_info=True)
