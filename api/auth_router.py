@@ -9,7 +9,6 @@ except ImportError:
     SupabaseClient = None
 
 router = APIRouter(
-    prefix="/auth",
     tags=["authentication"]
 )
 logger = logging.getLogger(__name__)
