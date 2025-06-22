@@ -229,8 +229,8 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
             if user.get("last_known_location"):
                 supabase.table("orders").update({"status": "awaiting_location_confirmation"}).eq("id", order['id']).execute()
                 return (
-                    "I see you have a saved location with us. Would you like to use it for this delivery?\\n\\n"
-                    "1. Yes, use saved location\\n"
+                    "I see you have a saved location with us. Would you like to use it for this delivery?\n\n"
+                    "1. Yes, use saved location\n"
                     "2. No, I'll provide a new one"
                 )
             else:
@@ -240,9 +240,9 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
             supabase.table("orders").update({"delivery_type": "pickup", "status": "pending_payment"}).eq("id", order['id']).execute()
             payment_link = await generate_paystack_payment_link(order['id'], order['total_amount'], from_number)
             return (
-                f"Alright, your order is set for pickup.\\n\\n"
-                f"Your total is *GHS {order['total_amount']:.2f}*.\\n\\n"
-                f"Please complete your payment here to confirm your order:\\n{payment_link}"
+                f"Alright, your order is set for pickup.\n\n"
+                f"Your total is *GHS {order['total_amount']:.2f}*.\n\n"
+                f"Please complete your payment here to confirm your order:\n{payment_link}"
             )
         else:
             return "Sorry, I didn't get that. Please choose '1' for Delivery or '2' for Pickup."
@@ -269,9 +269,9 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
             
             payment_link = await generate_paystack_payment_link(order['id'], total_with_delivery, from_number)
             return (
-                f"Using your saved location. The delivery fee is GHS {delivery_fee:.2f}.\\n\\n"
-                f"Your new total is *GHS {total_with_delivery:.2f}*.\\n\\n"
-                f"Please complete your payment here:\\n{payment_link}"
+                f"Using your saved location. The delivery fee is GHS {delivery_fee:.2f}.\n\n"
+                f"Your new total is *GHS {total_with_delivery:.2f}*.\n\n"
+                f"Please complete your payment here:\n{payment_link}"
             )
         elif body == "2": # No, use new one
             supabase.table("orders").update({"status": "awaiting_location"}).eq("id", order['id']).execute()
@@ -287,9 +287,9 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
             total = order.get('total_with_delivery') or order['total_amount']
             payment_link = await generate_paystack_payment_link(order['id'], total, from_number)
             return (
-                f"Just a reminder, you have a pending order with us waiting for payment.\\n\\n"
-                f"Total: *GHS {total:.2f}*\\n\\n"
-                f"Pay here to confirm: {payment_link}\\n\\n"
+                f"Just a reminder, you have a pending order with us waiting for payment.\n\n"
+                f"Total: *GHS {total:.2f}*\n\n"
+                f"Pay here to confirm: {payment_link}\n\n"
                 f"If you'd like to cancel this order, just reply 'cancel'."
             )
             
@@ -301,9 +301,9 @@ async def handle_pending_order(order: Dict[str, Any], body: str, from_number: st
     total = order.get('total_with_delivery') or order['total_amount']
     payment_link = await generate_paystack_payment_link(order['id'], total, from_number)
     return (
-        f"It looks like you have an order in progress waiting for payment.\\n\\n"
-        f"Total Amount: *GHS {total:.2f}*.\\n\\n"
-        f"You can complete your payment here:\\n{payment_link}\\n\\n"
+        f"It looks like you have an order in progress waiting for payment.\n\n"
+        f"Total Amount: *GHS {total:.2f}*.\n\n"
+        f"You can complete your payment here:\n{payment_link}\n\n"
         f"Or, reply 'cancel' to cancel this order."
     )
 
@@ -331,13 +331,20 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     
     elif intent == "check_status":
         try:
-            # More robustly query for the latest paid, active order.
+            # First check if there are any unpaid orders that might be interfering
+            unpaid_orders_res = supabase.table("orders").select("id").eq("user_id", user_id).eq("payment_status", "unpaid").limit(1).execute()
+            
+            if unpaid_orders_res.data:
+                # User has unpaid orders, so they're probably asking about those
+                return "You have an unpaid order waiting for payment. Would you like to complete the payment or cancel it?"
+            
+            # If no unpaid orders, check for paid orders being delivered
             paid_orders_res = supabase.table("orders").select("status").eq("user_id", user_id).in_("status", ["processing", "out-for-delivery"]).order("created_at", desc=True).limit(1).execute()
             
             if paid_orders_res.data:
                 return f"I've found your latest order. Its current status is: *{paid_orders_res.data[0]['status']}*."
             else:
-                return "It looks like you don't have any paid orders with us right now. Can I help you start a new one?"
+                return "It looks like you don't have any orders being delivered right now. Can I help you start a new one?"
         except Exception as e:
             logger.error(f"Error checking order status for user {user_id}: {e}", exc_info=True)
             return "I'm having trouble looking up your order details right now. Please try again in a moment."
@@ -443,9 +450,9 @@ async def whatsapp_webhook(request: Request):
                     # Generate payment link and send it
                     payment_link = await generate_paystack_payment_link(order['id'], total_with_delivery, from_number)
                     msg = (
-                        f"Great, location received! Your delivery fee is GHS {delivery_fee:.2f}.\\n\\n"
-                        f"Your total amount is now *GHS {total_with_delivery:.2f}*.\\n\\n"
-                        f"Please complete your payment here to confirm your order:\\n{payment_link}"
+                        f"Great, location received! Your delivery fee is GHS {delivery_fee:.2f}.\n\n"
+                        f"Your total amount is now *GHS {total_with_delivery:.2f}*.\n\n"
+                        f"Please complete your payment here to confirm your order:\n{payment_link}"
                     )
                     await send_whatsapp_message(from_number, msg)
                 else:
