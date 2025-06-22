@@ -246,6 +246,9 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
             - `repeat`: User is asking you to repeat the last message or information you sent.
             - `thank_you`: User is expressing gratitude (e.g., thank you, thanks).
             - `affirmative_acknowledgement`: User is confirming information or giving a simple positive reply (e.g., okay, ok, got it, sounds good, sure).
+            - `negative_acknowledgement`: User is providing a negative reply, indicating they don't need further help (e.g., no, nope, that's all, I'm good).
+            - `multi_intent`: User is asking for two or more things at once (e.g., "I want to buy tomatoes and where is my order?").
+            - `modify_order`: User wants to change, add, or remove items from an order they've just confirmed but haven't paid for yet.
             - `unknown`: The message is irrelevant to grocery shopping, unclear, or outside the bot's capabilities (e.g., telling a joke, asking for personal details, spam).
 
             Your JSON output MUST contain these two fields:
@@ -259,6 +262,9 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
                 - `repeat`: "Certainly, I can repeat that."
                 - `thank_you`: "You're welcome!"
                 - `affirmative_acknowledgement`: "Great! Is there anything else I can help you with?"
+                - `negative_acknowledgement`: "Alright, have a great day! Feel free to message me anytime you need groceries."
+                - `multi_intent`: "I can help with one thing at a time. Please ask about your order status or placing a new order separately."
+                - `modify_order`: "No problem, I can help with that."
                 - `unknown`: "I'm sorry, I can only help with grocery orders."
 
             Example response format:
@@ -333,6 +339,16 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
              logger.warning("GEMINI_API_KEY not set, using fallback logic for intent extraction.")
              # --- Fallback logic - simple keyword matching with basic typo tolerance ---
              lower_msg = message.lower().strip()
+             
+             # Multi-intent check
+             buy_present = any(word in lower_msg for word in ["buy", "want", "order", "menu"])
+             status_present = any(word in lower_msg for word in ["status", "track", "where is my"])
+             if buy_present and status_present:
+                 return {"intent": "multi_intent", "response": "I can help with one thing at a time. Please ask about your order status or placing a new order separately."}
+             
+             if any(word in lower_msg for word in ["add", "change", "modify", "forgot"]):
+                return {"intent": "modify_order", "response": "No problem, I can help with that."}
+
              if "cancel" in lower_msg: return {"intent": "cancel_order", "response": "Okay, I can help with cancelling an order."}
              if "status" in lower_msg or "track" in lower_msg or "where is my order" in lower_msg: return {"intent": "check_status", "response": "Let me check on your order."}
              if any(word in lower_msg for word in ["buy", "want", "order", "menu", "available", "shop"]):
@@ -347,6 +363,8 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
                   return {"intent": "thank_you", "response": "You're welcome!"}
              if lower_msg in ["ok", "okay", "k", "ok."]:
                  return {"intent": "affirmative_acknowledgement", "response": "Great! Is there anything else I can help you with?"}
+             if lower_msg in ["no", "nope", "no thanks", "no."]:
+                 return {"intent": "negative_acknowledgement", "response": "Alright, have a great day! Feel free to message me anytime you need groceries."}
              return {"intent": "unknown", "response": "I'm sorry, I can only assist with grocery orders. Could you please rephrase?"}
          else:
              # Handle other ValueErrors from call_gemini_api (e.g. empty text payload)
@@ -620,6 +638,17 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     elif intent == "affirmative_acknowledgement":
         reply_message = ai_response_ack
+
+    elif intent == "negative_acknowledgement":
+        reply_message = ai_response_ack
+
+    elif intent == "multi_intent":
+        reply_message = ai_response_ack
+
+    elif intent == "modify_order":
+        # This case is primarily handled inside the pending_order logic.
+        # This is a fallback if it's detected in a new conversation.
+        reply_message = f"{ai_ack} It looks like you don't have an active order to modify. Would you like to start a new one?"
 
     else: # unknown or any other unhandled intent by Gemini/fallback
         logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{original_message}')")
@@ -1056,34 +1085,45 @@ async def whatsapp_webhook(request: Request):
                     intent = gemini_result.get('intent')
                     ai_ack = gemini_result.get('response', 'Okay.')
 
-                    # Construct a reminder message based on the current pending status
-                    reminder_message = ""
-                    if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
-                         reminder_message = "\n\nBut please first choose '1' for Delivery or '2' for Pickup for your pending order."
-                    elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
-                         reminder_message = "\n\nBut please first reply '1' or '2' regarding your saved location for your pending order."
-                    elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION:
-                         reminder_message = "\n\nBut I'm still waiting for your delivery location for your pending order. Please share it using the location feature."
-                    elif current_status == DefaultStatus.ORDER_PENDING_PAYMENT:
-                         total = active_pending_order.get('total_with_delivery') or active_pending_order['total_amount']
-                         total_formatted = f"{total:.2f}" if total is not None else "N/A"
-                         try:
-                             # Attempt to re-generate the payment link for the reminder
-                             payment_link = await generate_paystack_payment_link(order_id, total, from_number_clean)
-                             reminder_message = (
-                                 f"\n\nBut you have a pending order ({order_number}) waiting for payment (GHS {total_formatted}). Please pay here: {payment_link}\n"
-                                 "Or reply 'cancel'."
-                             )
-                         except Exception as e:
-                              logger.error(f"Failed to re-generate payment link for reminder for order {order_id}: {e}", exc_info=True)
-                              # Provide a fallback reminder if link generation fails
-                              reminder_message = f"\n\nBut you have a pending order ({order_number}) waiting for payment. Please reply 'cancel' if you don't want to proceed."
+                    if intent == 'modify_order':
+                        handled_by_pending_state = True
+                        logger.info(f"User {user_id} wants to modify pending order {order_id}. Cancelling and creating new session.")
+                        try:
+                            # 1. Cancel the current pending order
+                            supabase.table("orders").update({
+                                "status": DefaultStatus.ORDER_CANCELLED,
+                                "payment_status": DefaultStatus.PAYMENT_CANCELLED,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                                "cancellation_reason": "user modified selection"
+                            }).eq("id", order_id).execute()
 
-                    # Combine the AI acknowledgement with the reminder message
-                    reply_message = f"{ai_ack}{reminder_message}"
+                            # 2. Create a new session and link, like in 'buy' intent
+                            session_token = str(uuid.uuid4())
+                            selection_url = f"{settings.FRONTEND_URL}?session={session_token}"
+                            now_utc = datetime.now(timezone.utc)
+                            supabase.table("sessions").insert({
+                                "user_id": user_id,
+                                "phone_number": from_number_clean,
+                                "session_token": session_token,
+                                "created_at": now_utc.isoformat(),
+                                "expires_at": (now_utc + timedelta(hours=24)).isoformat()
+                            }).execute()
 
-                    # Log the intent even if it wasn't a specific command
-                    logger.info(f"Text message for pending order {order_id} not handled by state command. Intent: '{intent}'. Reply: '{reply_message}'")
+                            # 3. Formulate the reply
+                            reply_message = (
+                                f"{ai_ack} To change your items, please make a new selection with this link. "
+                                f"Your previous cart has been cancelled.\n\n{selection_url}"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error modifying pending order {order_id} for user {user_id}: {e}", exc_info=True)
+                            reply_message = "I'm sorry, I ran into a problem trying to modify your order. Please try again."
+                        
+                    else:
+                        # Construct a reminder message based on the current pending status
+                        reminder_message = ""
+                        if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
+                             reminder_message = "\n\nBut please first choose '1' for Delivery or '2' for Pickup for your pending order."
+                    # ... existing code ...
 
                 # else: # This else block was misplaced and caused issues. Removed.
                 #    reply_message = f"I'm not sure how to help with that right now. You currently have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
