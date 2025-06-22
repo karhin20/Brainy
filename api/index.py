@@ -115,7 +115,7 @@ PaymentStatus = Literal[
 
 class DefaultStatus:
     ORDER_PENDING_CONFIRMATION: OrderStatus = "pending_confirmation"
-    ORDER_AWAITing_LOCATION: OrderStatus = "awaiting_location"
+    ORDER_AWAITING_LOCATION: OrderStatus = "awaiting_location"
     ORDER_AWAITING_LOCATION_CONFIRMATION: OrderStatus = "awaiting_location_confirmation"
     ORDER_PENDING_PAYMENT: OrderStatus = "pending_payment"
     ORDER_PROCESSING: OrderStatus = "processing"
