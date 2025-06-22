@@ -424,7 +424,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     intent = intent_data.get("intent")
     ai_response_ack = intent_data.get("response", "Okay.")
 
-    logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}. Message: '{original_message}'")
+    logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}. Message: '{original_message}'") # CORRECTED LOGGING
 
     if intent == "buy":
         session_token = str(uuid.uuid4())
@@ -493,7 +493,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
 
     elif intent == "help":
-        # **APPLIED TO HELP:** Already combined AI ack with help text in previous step.
+        # **APPLIED TO HELP:** Combine AI ack with help text
          return (
              f"{ai_response_ack}\n\n" # Start with AI's canned "I can help with that. What do you need?"
              "I can help you with the following:\n\n" # Clearly introduce the list
@@ -952,7 +952,10 @@ async def whatsapp_webhook(request: Request):
                 await send_whatsapp_message(from_number_clean, reply_message)
                 logger.info(f"Sent reply to {from_number_clean}.")
                 try:
-                    supabase.table("users").update({"last_bot_message": reply_message}).eq("id", user_id).execute()
+                    # Save the sent message as last_bot_message for 'repeat' intent
+                    # Limit length to avoid excessive storage
+                    truncated_message = reply_message[:1000] # Limit to first 1000 chars
+                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute()
                     logger.info(f"Saved last bot message for user {user_id}.")
                 except Exception as e:
                      logger.error(f"Failed to save last bot message for user {user_id}: {e}", exc_info=True)
@@ -1060,10 +1063,12 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
                 await send_whatsapp_message(phone_number, delivery_msg)
                 logger.info(f"Sent confirmation message to user {user_id} ({phone_number}) for order {order_id}")
                 try:
-                    supabase.table("users").update({"last_bot_message": delivery_msg}).eq("id", user_id).execute();
+                    # Save the sent message as last_bot_message
+                    truncated_message = delivery_msg[:1000]
+                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute()
                     logger.info(f"Saved last bot message for user {user_id} from /confirm-items.")
                 except Exception as e:
-                     logger.error(f"Failed to save last bot message for user {user_id} from /confirm-items: {e}", exc_info=True);
+                     logger.error(f"Failed to save last bot message for user {user_id} from /confirm-items: {e}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"Failed to send WhatsApp confirmation message to {phone_number} for order {order_id}: {e}", exc_info=True)
