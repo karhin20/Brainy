@@ -118,7 +118,7 @@ async def call_gemini_intent_extraction(message: str, user_context: dict) -> dic
         if "status" in message.lower(): return {"intent": "check_status"}
         if "buy" in message.lower() or "want" in message.lower(): return {"intent": "buy", "products": []}
         return {"intent": "greet", "response": "Hello! How can I help you today?"}
-
+    
     try:
         headers = {"Content-Type": "application/json"}
         params = {"key": GEMINI_API_KEY}
@@ -192,11 +192,14 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
     # Generate a placeholder email as Paystack requires one.
     placeholder_email = f"{user_phone.replace('+', '')}@market.bot"
 
+    # Add timestamp to prevent duplicate reference errors
+    unique_reference = f"{order_id}_{int(datetime.now().timestamp())}"
+
     payload = {
         "email": placeholder_email,
         "amount": int(amount * 100),  # Paystack expects amount in kobo
         "currency": "GHS",
-        "reference": order_id,
+        "reference": unique_reference,
         "callback_url": f"{FRONTEND_URL}/payment-success?order_id={order_id}",
         "channels": ["card", "mobile_money"],
         "metadata": {"order_id": order_id, "phone": user_phone}
@@ -475,7 +478,7 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
     try:
         if not supabase:
             raise HTTPException(status_code=500, detail="Database connection not available")
-        
+            
         # 1. Look up the session to get user_id and phone_number
         session_res = supabase.table("sessions").select("user_id, phone_number").eq("session_token", request.session_token).single().execute()
         
