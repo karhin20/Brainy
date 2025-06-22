@@ -7,7 +7,7 @@ import logging
 import hmac
 import hashlib
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Literal
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Security, status
@@ -211,7 +211,7 @@ async def health_check():
         "paystack_secret_key": paystack_key_status,
         "gemini_api_key": gemini_key_status,
         "external_services": {}, # Placeholder
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
@@ -494,14 +494,15 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
             # Add a check for existing active sessions for this user/phone if needed,
             # though current logic relies on the /confirm-items cleanup.
             # For simplicity, proceeding with insert.
+            now_utc = datetime.now(timezone.utc)
             insert_res = supabase.table("sessions").insert({
                 "user_id": user_id,
                 "phone_number": from_number,
                 "session_token": session_token,
                 "last_intent": "buy", # Store intent for session context if needed later
-                "created_at": datetime.now().isoformat(),
+                "created_at": now_utc.isoformat(),
                 # Sessions expire after 24 hours
-                "expires_at": (datetime.now() + timedelta(hours=24)).isoformat()
+                "expires_at": (now_utc + timedelta(hours=24)).isoformat()
             }).execute()
             # Check result for success if the supabase client version supports it returning data/status
             if not insert_res.data:
@@ -785,7 +786,7 @@ async def whatsapp_webhook(request: Request):
         user_id = user['id']
         # Update last_active timestamp (fire and forget, doesn't need to block)
         try:
-             supabase.table("users").update({"last_active": datetime.now().isoformat()}).eq("id", user['id']).execute()
+             supabase.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("id", user['id']).execute()
         except Exception as e:
              logger.error(f"Failed to update last_active for user {user_id}: {e}", exc_info=True)
 
@@ -807,8 +808,8 @@ async def whatsapp_webhook(request: Request):
                     supabase.table("orders").update({
                         "status": DefaultStatus.ORDER_CANCELLED,
                         "payment_status": DefaultStatus.PAYMENT_CANCELLED,
-                        "cancelled_at": datetime.now().isoformat(),
-                        "updated_at": datetime.now().isoformat(),
+                        "cancelled_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                         "cancellation_reason": "superseded by newer pending order"
                     }).in_("id", older_order_ids).execute()
                     logger.info(f"Cancelled older pending orders: {older_order_ids}")
@@ -841,7 +842,7 @@ async def whatsapp_webhook(request: Request):
                         "total_with_delivery": total_with_delivery,
                         "delivery_location_lat": latitude,
                         "delivery_location_lon": longitude,
-                        "updated_at": datetime.now().isoformat()
+                        "updated_at": datetime.now(timezone.utc).isoformat()
                     }
                     supabase.table("orders").update(update_data).eq("id", order_id).execute()
                     logger.info(f"Updated order {order_id} with delivery details and status {DefaultStatus.ORDER_PENDING_PAYMENT}")
@@ -892,7 +893,7 @@ async def whatsapp_webhook(request: Request):
                              # User has a saved location, ask if they want to use it
                              try:
                                 # Update status to await confirmation for saved location
-                                supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
+                                supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                                 logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION}")
                                 reply_message = (
                                     "I see you have a saved delivery location with us. Would you like to use it for this order?\n\n"
@@ -907,7 +908,7 @@ async def whatsapp_webhook(request: Request):
                              # User has no saved location, ask them to share it
                              try:
                                 # Update status to await location sharing
-                                supabase.table("orders").update({"delivery_type": "delivery", "status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
+                                supabase.table("orders").update({"delivery_type": "delivery", "status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                                 logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_AWAITING_LOCATION}")
                                 reply_message = (
                                     "Great! Please share your delivery location using the WhatsApp location sharing feature.\n\n"
@@ -922,7 +923,7 @@ async def whatsapp_webhook(request: Request):
                           handled_by_pending_state = True
                           try:
                             # Update status to pending payment for pickup
-                            supabase.table("orders").update({"delivery_type": "pickup", "status": DefaultStatus.ORDER_PENDING_PAYMENT, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
+                            supabase.table("orders").update({"delivery_type": "pickup", "status": DefaultStatus.ORDER_PENDING_PAYMENT, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_PENDING_PAYMENT} (pickup)")
 
                             # Generate payment link for the original total amount
@@ -948,7 +949,7 @@ async def whatsapp_webhook(request: Request):
                             logger.warning(f"User {user_id} replied '1' to location confirmation but had no saved location. Order {order_id}")
                             try:
                                 # Revert status to awaiting location sharing
-                                supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
+                                supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                                 reply_message = (
                                     "It seems your saved location wasn't available.\n\n"
                                     "Please share your delivery location using the WhatsApp location sharing feature.\n"
@@ -977,7 +978,7 @@ async def whatsapp_webhook(request: Request):
                                     "total_with_delivery": total_with_delivery,
                                     "delivery_location_lat": latitude,
                                     "delivery_location_lon": longitude,
-                                    "updated_at": datetime.now().isoformat()
+                                    "updated_at": datetime.now(timezone.utc).isoformat()
                                 }
                                 supabase.table("orders").update(update_data).eq("id", order_id).execute()
                                 logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_PENDING_PAYMENT} using saved location.")
@@ -995,7 +996,7 @@ async def whatsapp_webhook(request: Request):
                                 logger.error(f"Invalid saved location data or fee processing error for user {user_id}: {location_str}. Error: {e}", exc_info=True)
                                 try:
                                     # Revert status to awaiting location sharing if saved data was bad
-                                    supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
+                                    supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                                     reply_message = (
                                         "It seems there was an issue with your saved location data.\n\n"
                                         "Please share your delivery location again using the WhatsApp location sharing feature.\n"
@@ -1015,7 +1016,7 @@ async def whatsapp_webhook(request: Request):
                         handled_by_pending_state = True
                         try:
                             # Update status to await location sharing
-                            supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
+                            supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_AWAITING_LOCATION} (user providing new)")
                             reply_message = (
                                 "Okay, no problem.\n\n"
@@ -1039,8 +1040,8 @@ async def whatsapp_webhook(request: Request):
                             supabase.table("orders").update({
                                 "status": DefaultStatus.ORDER_CANCELLED,
                                 "payment_status": DefaultStatus.PAYMENT_CANCELLED, # Also mark payment as cancelled
-                                "cancelled_at": datetime.now().isoformat(),
-                                "updated_at": datetime.now().isoformat(),
+                                "cancelled_at": datetime.now(timezone.utc).isoformat(),
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
                                 "cancellation_reason": "user requested cancellation"
                             }).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} successfully cancelled by user {user_id}.")
@@ -1190,7 +1191,7 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
         # Explicitly check session expiry
         try:
             expires_at = datetime.fromisoformat(expires_at_str)
-            if datetime.now() > expires_at:
+            if datetime.now(timezone.utc) > expires_at:
                  logger.warning(f"Session token {request.session_token} expired for user {user_id}.")
                  # Delete the expired session proactively
                  try:
@@ -1214,8 +1215,8 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
             supabase.table("orders").update({
                 "status": DefaultStatus.ORDER_CANCELLED,
                 "payment_status": DefaultStatus.PAYMENT_CANCELLED,
-                "cancelled_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat(),
+                "cancelled_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
                 "cancellation_reason": "superseded by new order via web menu"
             }).eq("user_id", user_id).eq("payment_status", DefaultStatus.PAYMENT_UNPAID).not_.in_("status", [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]).execute()
             logger.info(f"Cancelled older pending orders for user {user_id} during confirm-items.")
@@ -1232,8 +1233,8 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
             "total_amount": request.total_amount,
             "status": DefaultStatus.ORDER_PENDING_CONFIRMATION, # Initial status
             "payment_status": DefaultStatus.PAYMENT_UNPAID,
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }
 
         try:
@@ -1377,7 +1378,7 @@ async def payment_success_webhook(request: Request):
         update_data: Dict[str, Any] = {
              "paystack_reference": final_reference,
              "amount_paid_kobo": paystack_amount_kobo, # Store the amount received
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
              "paystack_status": paystack_status, # Store paystack's status
              "paystack_gateway_response": paystack_gateway_response # Store gateway response
         }
