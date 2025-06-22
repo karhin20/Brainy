@@ -529,12 +529,13 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         try:
             # Look for the latest paid order that's not cancelled or delivered.
             # Select ALL relevant fields including status, type, fees, location if available
-            active_paid_orders_res = supabase.table("orders").select("status, id, delivery_type, delivery_fee, total_amount, total_with_delivery, delivery_location_lat, delivery_location_lon").eq("user_id", user_id).in_("payment_status", [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]).not_.in_("status", [DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
+            active_paid_orders_res = supabase.table("orders").select("status, id, order_number, delivery_type, delivery_fee, total_amount, total_with_delivery, delivery_location_lat, delivery_location_lon").eq("user_id", user_id).in_("payment_status", [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]).not_.in_("status", [DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
 
             # Provide detailed message based on the found order's specific status
             if active_paid_orders_res.data:
                 latest_order = active_paid_orders_res.data[0]
                 order_id = latest_order['id']
+                order_number = latest_order.get('order_number', order_id) # Fallback to id
                 current_order_status = latest_order['status']
                 delivery_type = latest_order.get('delivery_type', 'N/A')
                 total_display = latest_order.get('total_with_delivery') or latest_order.get('total_amount')
@@ -544,7 +545,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
                 delivery_type_display = delivery_type.replace('_', ' ').title()
 
                 # Build a status-specific message
-                reply_message = f"{ai_response_ack} Your latest active order (ID: {order_id}) is currently *{status_display}* ({delivery_type_display})."
+                reply_message = f"{ai_response_ack} Your latest active order ({order_number}) is currently *{status_display}* ({delivery_type_display})."
 
                 # Add more context based on specific status
                 if current_order_status == DefaultStatus.ORDER_PROCESSING:
@@ -556,10 +557,10 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
                      # TODO: Add estimated time or tracking link if available in DB/system
                 elif current_order_status == DefaultStatus.ORDER_DELIVERED:
                      # Although filtered out by not_.in_, handle defensively (shouldn't happen here)
-                     reply_message = f"{ai_response_ack} Your latest order (ID: {order_id}) was delivered."
+                     reply_message = f"{ai_response_ack} Your latest order ({order_number}) was delivered."
                 elif current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT:
                      # Although filtered out by payment_status check, handle defensively
-                     reply_message = f"{ai_response_ack} You have a pending order (ID: {order_id}) waiting for payment. Total: GHS {total_display_formatted}."
+                     reply_message = f"{ai_response_ack} You have a pending order ({order_number}) waiting for payment. Total: GHS {total_display_formatted}."
                      # Could add payment link here, but this branch is for *paid* orders primarily
 
                 # Check if the user specifically asked about payment or pickup within the check_status intent (Less likely for paid orders, but possible)
@@ -575,9 +576,10 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
             else:
                 # No active paid orders found, check for a recent delivered one
-                recent_delivered_res = supabase.table("orders").select("id").eq("user_id", user_id).eq("status", DefaultStatus.ORDER_DELIVERED).order("created_at", desc=True).limit(1).execute()
+                recent_delivered_res = supabase.table("orders").select("id, order_number").eq("user_id", user_id).eq("status", DefaultStatus.ORDER_DELIVERED).order("created_at", desc=True).limit(1).execute()
                 if recent_delivered_res.data:
-                    reply_message = f"{ai_response_ack} Your latest order (ID: {recent_delivered_res.data[0]['id']}) has already been delivered. Can I help you start a new one?"
+                    order_number = recent_delivered_res.data[0].get('order_number', recent_delivered_res.data[0]['id'])
+                    reply_message = f"{ai_response_ack} Your latest order ({order_number}) has already been delivered. Can I help you start a new one?"
                 else:
                      reply_message = f"{ai_response_ack} It looks like you don't have any active orders right now. Can I help you start a new one?"
         except Exception as e:
@@ -879,6 +881,7 @@ async def whatsapp_webhook(request: Request):
             lower_incoming_msg = incoming_msg.lower().strip()
             handled_by_pending_state = False
             order_id = active_pending_order['id'] if active_pending_order else None
+            order_number = active_pending_order.get('order_number', order_id) if active_pending_order else None
             current_status: Optional[OrderStatus] = active_pending_order.get('status') if active_pending_order else None
 
             if active_pending_order:
@@ -1033,7 +1036,7 @@ async def whatsapp_webhook(request: Request):
                 if lower_incoming_msg == 'cancel':
                     handled_by_pending_state = True # Mark as handled
                     if current_status in [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]:
-                         reply_message = f"This order (ID: {order_id}) is already marked as *{current_status.replace('_', ' ').title()}* and cannot be cancelled."
+                         reply_message = f"This order ({order_number}) is already marked as *{current_status.replace('_', ' ').title()}* and cannot be cancelled."
                     else:
                          try:
                             # Update order status to cancelled
@@ -1045,7 +1048,7 @@ async def whatsapp_webhook(request: Request):
                                 "cancellation_reason": "user requested cancellation"
                             }).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} successfully cancelled by user {user_id}.")
-                            reply_message = f"Your order (ID: {order_id}) has been cancelled. Please let me know if there's anything else I can help with."
+                            reply_message = f"Your order ({order_number}) has been cancelled. Please let me know if there's anything else I can help with."
                          except Exception as e:
                             logger.error(f"Failed to cancel order {order_id} for user {user_id}: {e}", exc_info=True)
                             reply_message = "Sorry, I had trouble cancelling your order right now. Please try again or contact support."
@@ -1074,13 +1077,13 @@ async def whatsapp_webhook(request: Request):
                              # Attempt to re-generate the payment link for the reminder
                              payment_link = await generate_paystack_payment_link(order_id, total, from_number_clean)
                              reminder_message = (
-                                 f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment (GHS {total_formatted}). Please pay here: {payment_link}\n"
+                                 f"\n\nBut you have a pending order ({order_number}) waiting for payment (GHS {total_formatted}). Please pay here: {payment_link}\n"
                                  "Or reply 'cancel'."
                              )
                          except Exception as e:
                               logger.error(f"Failed to re-generate payment link for reminder for order {order_id}: {e}", exc_info=True)
                               # Provide a fallback reminder if link generation fails
-                              reminder_message = f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment. Please reply 'cancel' if you don't want to proceed."
+                              reminder_message = f"\n\nBut you have a pending order ({order_number}) waiting for payment. Please reply 'cancel' if you don't want to proceed."
 
                     # Combine the AI acknowledgement with the reminder message
                     reply_message = f"{ai_ack}{reminder_message}"
@@ -1355,7 +1358,7 @@ async def payment_success_webhook(request: Request):
 
 
         # Fetch the order from the database
-        order_res = supabase.table("orders").select("id, user_id, payment_status, status, total_amount, total_with_delivery, delivery_type").eq("id", order_id).limit(1).execute()
+        order_res = supabase.table("orders").select("id, order_number, user_id, payment_status, status, total_amount, total_with_delivery, delivery_type").eq("id", order_id).limit(1).execute()
 
         if not order_res.data:
             logger.warning(f"Paystack webhook: No order found in DB for order_id {order_id} (Paystack ref: {final_reference}).")
@@ -1505,11 +1508,12 @@ async def payment_success_webhook(request: Request):
                  # Use the potentially updated statuses for the notification message
                  status_display = new_order_status.replace('-', ' ').title()
                  payment_status_display = new_payment_status.replace('_', ' ').title()
+                 order_number_display = order.get('order_number', order_id)
 
 
                  notification_message = (
                      f"{notification_prefix}\n\n"
-                     f"Your Order ID is: {order_id}.\n"
+                     f"Your Order ID is: {order_number_display}.\n"
                      f"Amount Paid: *GHS {total_paid_display:.2f}*.\n"
                      f"Current Order Status: *{status_display}*.\n"
                      f"Payment Status: *{payment_status_display}*.\n"
