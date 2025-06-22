@@ -2,6 +2,8 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from os import getenv
 import logging
+import os
+import httpx
 
 try:
     from supabase_client import supabase, SupabaseClient
@@ -14,6 +16,9 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 logger = logging.getLogger(__name__)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_KEY")
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
     """
@@ -28,9 +33,9 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
         )
     return api_key
 
-async def verify_jwt(token: str = Depends(oauth2_scheme), db: SupabaseClient = Depends(lambda: supabase)):
+async def verify_jwt(token: str = Depends(oauth2_scheme)):
     """
-    Verifies the JWT token from a user's session to protect admin endpoints.
+    Verifies the JWT token from a user's session by calling the Supabase Auth REST API.
     """
     if not token:
         logger.warning("JWT verification failed: Token is missing.")
@@ -38,26 +43,44 @@ async def verify_jwt(token: str = Depends(oauth2_scheme), db: SupabaseClient = D
             status_code=status.HTTP_401_UNAUTHORIZED, 
             detail="Not authenticated"
         )
-    if not db:
-        logger.error("JWT verification failed: Database connection not available.")
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        logger.error("JWT verification failed: Supabase URL or Key not configured on the server.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
-            detail="Authentication service is down"
+            detail="Authentication service is misconfigured"
         )
         
     try:
-        user_response = db.auth.get_user(token)
-        user = user_response.user
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid token or expired session.")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {token}"
+                }
+            )
         
-        # You can add role checks here in the future if needed
-        # For example: if user.app_metadata.get('role') != 'admin':
-        #   raise HTTPException(status_code=403, detail="Not authorized")
+        if response.status_code == 200:
+            user = response.json()
+            # You can add role checks here in the future if needed
+            # For example: if user.get('app_metadata', {}).get('role') != 'admin':
+            #   raise HTTPException(status_code=403, detail="Not authorized")
+            return user
+        else:
+            logger.warning(f"JWT verification failed with status {response.status_code}: {response.text}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token or expired session."
+            )
             
-        return user
+    except httpx.RequestError as e:
+        logger.error(f"JWT verification failed due to a network error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not connect to the authentication service.",
+        )
     except Exception as e:
-        logger.error(f"JWT verification failed with an exception: {e}", exc_info=True)
+        logger.error(f"JWT verification failed with an unexpected exception: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
