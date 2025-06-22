@@ -1,3 +1,5 @@
+
+
 import os
 import sys
 import uuid
@@ -228,7 +230,7 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
                 - `greet`: "Hello! How can I assist you today?"
                 - `help`: "I can help with that. What do you need?"
                 - `repeat`: "Certainly, I can repeat that."
-                - `thank_you`: "You're welcome!" # Corrected typo here
+                - `thank_you`: "You're welcome!"
                 - `unknown`: "I'm sorry, I can only help with grocery orders."
 
             Example response format:
@@ -424,7 +426,6 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     intent = intent_data.get("intent")
     ai_response_ack = intent_data.get("response", "Okay.")
 
-    # Use original_message for logging here
     logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}. Message: '{original_message}'")
 
     if intent == "buy":
@@ -440,8 +441,14 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
                 "expires_at": (datetime.now() + timedelta(hours=24)).isoformat()
             }).execute()
             logger.info(f"Created new session {session_token} for user {user_id}")
-            greeting_part = "Welcome! " if is_new_user else "Great! "
-            return f"{greeting_part}You can browse our fresh items and place your order using this secure link: {selection_url}"
+
+            # **APPLIED TO BUY:** Combine AI acknowledgement with menu link message
+            greeting_part = "Welcome! " if is_new_user else ""
+            return (
+                f"{ai_response_ack} {greeting_part}"
+                f"You can select the fresh items you'd like to purchase from our online menu here:\n"
+                f"{selection_url}"
+            )
         except Exception as e:
             logger.error(f"Failed to create session for user {user_id} (buy intent): {e}", exc_info=True)
             return "Sorry, I'm having trouble starting a new order right now. Please try again in a moment."
@@ -450,6 +457,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         try:
             active_paid_orders_res = supabase.table("orders").select("status, id, delivery_type").eq("user_id", user_id).in_("payment_status", [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]).not_.in_("status", [DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
 
+            # **APPLIED TO CHECK_STATUS:** Combine AI acknowledgement with status message
             if active_paid_orders_res.data:
                 latest_order = active_paid_orders_res.data[0]
                 status_display = latest_order['status'].replace('-', ' ').title()
@@ -466,32 +474,52 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
             return f"{ai_response_ack} I'm having trouble looking up your order details right now. Please try again in a moment."
 
     elif intent == "cancel_order":
+        # **APPLIED TO CANCEL_ORDER:** Combine AI acknowledgement with the 'no pending' message
         return f"{ai_response_ack} You don't have any pending orders to cancel right now."
 
     elif intent == "greet":
+        # **APPLIED TO GREET:** Combine AI acknowledgement with the welcome/welcome back message
         if is_new_user:
-            return "👋 Welcome to Fresh Market GH!\n\nI can help you order fresh groceries.\n\nTo start, just say 'I want to buy...' or 'Show me the menu'."
+            return (
+                f"{ai_response_ack}\n\n" # E.g., "Hello! How can I assist you today?"
+                "I can help you order fresh groceries.\n\n"
+                "To start, just say 'I want to buy...' or 'Show me the menu'."
+            )
         else:
             user_name = user.get('name')
             greeting_name = f", {user_name}!" if user_name else "!"
-            return f"👋 Welcome back to Fresh Market GH{greeting_name} How can I help you with your groceries today?"
+            return (
+                 f"{ai_response_ack}{greeting_name} " # E.g., "Hello! How can I assist you today, Kofi!"
+                 "How can I help you with your groceries today?"
+            )
 
 
     elif intent == "help":
-         return f"{ai_response_ack} I can help you:\n\n🛒 *Start a new grocery order:*\n Just say 'I want to buy...' or 'Show me the menu'.\n\n📦 *Check your order status:*\n Ask 'Where is my order?' or 'What is the status of my order?'.\n\n❌ *Cancel a pending order:*\n If you have an order waiting for payment, reply 'cancel'.\n\nWhat do you need assistance with today?"
+        # **APPLIED TO HELP:** Already combined AI ack with help text in previous step.
+         return (
+             f"{ai_response_ack}\n\n" # Start with AI's canned "I can help with that. What do you need?"
+             "I can help you with the following:\n\n" # Clearly introduce the list
+             "🛒 *Starting a new grocery order:*\n Just say 'I want to buy...' or 'Show me the menu'.\n\n"
+             "📦 *Checking your order status:*\n Ask 'Where is my order?' or 'What is the status of my order?'.\n\n"
+             "❌ *Cancelling a pending order:*\n If you have an order waiting for payment, reply 'cancel'.\n\n"
+             "What can I specifically assist you with regarding your groceries?" # Re-prompt
+         )
 
     elif intent == "repeat":
         last_msg = user.get('last_bot_message')
+        # **APPLIED TO REPEAT:** Combine AI acknowledgement with the repeated message
         if last_msg:
             return f"{ai_response_ack}\n\nI last said:\n> {last_msg}"
         else:
             return f"{ai_response_ack} I don't have a recent message to repeat right now."
 
     elif intent == "thank_you":
+        # **APPLIED TO THANK_YOU:** Already returns AI ack, fits the pattern.
          return ai_response_ack
 
     else: # unknown or any other unhandled intent
         logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{original_message}')")
+        # **APPLIED TO UNKNOWN:** Returns AI's specific unknown response.
         return ai_response_ack
 
 
@@ -861,7 +889,6 @@ async def whatsapp_webhook(request: Request):
                 # --- Handle messages that are *not* state-specific commands ---
                 if not handled_by_pending_state:
                     user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
-                    # **IMPROVEMENT: Use the new graceful handler which includes AI error handling**
                     gemini_result = await get_intent_gracefully(incoming_msg, user_context)
                     intent = gemini_result.get('intent')
                     ai_ack = gemini_result.get('response', 'Okay.')
@@ -877,7 +904,6 @@ async def whatsapp_webhook(request: Request):
                     elif current_status == DefaultStatus.ORDER_PENDING_PAYMENT:
                          total = active_pending_order.get('total_with_delivery') or active_pending_order['total_amount']
                          try:
-                             # Regenerate payment link for reminder
                              payment_link = await generate_paystack_payment_link(order_id, total, from_number_clean)
                              reminder_message = (
                                  f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment (GHS {total:.2f}). Please pay here: {payment_link}\n"
@@ -901,21 +927,18 @@ async def whatsapp_webhook(request: Request):
                          else:
                               reply_message = f"{ai_ack} However, you have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
 
-                    else: # Unknown or other intents while pending
+                    else:
                          reply_message = f"I'm not sure how to help with that right now. You currently have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
-                         if reminder_message: # Add specific reminder if available
+                         if reminder_message:
                               reply_message += reminder_message
 
 
             else: # No active pending order
                 user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
-                # **IMPROVEMENT: Use the new graceful handler which includes AI error handling**
                 gemini_result = await get_intent_gracefully(incoming_msg, user_context)
-                # **IMPROVEMENT: Pass incoming_msg to handle_new_conversation for logging/context**
                 reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg)
 
         else:
-             # Received an empty message or unhandled type after checking location/media
              logger.info(f"Received an empty or unhandled message type from user {user_id}.")
              if is_new_user:
                  reply_message = "👋 Welcome to Fresh Market GH!\n\nI can help you order fresh groceries.\n\nTo start, just say 'I want to buy...' or 'Show me the menu'."
@@ -931,7 +954,6 @@ async def whatsapp_webhook(request: Request):
                 await send_whatsapp_message(from_number_clean, reply_message)
                 logger.info(f"Sent reply to {from_number_clean}.")
                 try:
-                    # Save the sent message as last_bot_message for 'repeat' intent
                     supabase.table("users").update({"last_bot_message": reply_message}).eq("id", user_id).execute()
                     logger.info(f"Saved last bot message for user {user_id}.")
                 except Exception as e:
@@ -945,7 +967,6 @@ async def whatsapp_webhook(request: Request):
 
 
     except Exception as e:
-        # This catch-all should now only be for truly unexpected errors outside the AI call handling
         logger.error(f"Unhandled critical error in whatsapp_webhook for user {from_number_clean}: {e}", exc_info=True)
         if not reply_message and from_number_clean and send_whatsapp_message_available:
              try:
@@ -1215,10 +1236,10 @@ async def payment_success_webhook(request: Request):
                      await send_whatsapp_message(phone_number, notification_message)
                      logger.info(f"Notified user {order['user_id']} ({phone_number}) about order {order_id} payment status '{new_payment_status}'.")
                      try:
-                         supabase.table("users").update({"last_bot_message": notification_message}).eq("id", order['user_id']).execute()
-                         logger.info(f"Saved last bot message for user {order['user_id']} from /payment-success.")
+                         supabase.table("users").update({"last_bot_message": notification_message}).eq("id", order['user_id']).execute();
+                         logger.info(f"Saved last bot message for user {order['user_id']} from /payment-success.");
                      except Exception as e:
-                         logger.error(f"Failed to save last bot message for user {order['user_id']} from /payment-success: {e}", exc_info=True)
+                         logger.error(f"Failed to save last bot message for user {order['user_id']} from /payment-success: {e}", exc_info=True);
 
                  except Exception as e:
                       logger.error(f"Failed to send WhatsApp notification for paid order {order_id} to {phone_number}: {e}", exc_info=True)
