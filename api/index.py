@@ -429,7 +429,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     if intent == "buy":
         session_token = str(uuid.uuid4())
-        selection_url = f"{settings.FRONTEND_URL}/menu?session={session_token}"
+        selection_url = f"{settings.FRONTEND_URL}?session={session_token}"
         try:
             supabase.table("sessions").insert({
                 "user_id": user_id,
