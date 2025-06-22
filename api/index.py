@@ -1,4 +1,5 @@
 
+
 import os
 import sys
 import uuid
@@ -281,7 +282,6 @@ async def call_gemini_intent_extraction(message: str, user_context: Dict[str, An
 
     except httpx.RequestError as e: # Catch all httpx errors (connection, timeout, status)
         logger.error(f"Gemini API communication error: {e}", exc_info=True)
-        # Differentiate timeout vs other request errors if needed, but a general network error message works
         return {"intent": "unknown", "response": "I'm having trouble connecting to my service. Please try again in a moment."}
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding Gemini response JSON: {e}", exc_info=True)
@@ -338,7 +338,6 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
 
     except httpx.RequestError as e:
          logger.error(f"Paystack API request error: {e}", exc_info=True)
-         # Differentiate errors if needed, e.g., Timeout, NetworkError, HTTPStatusError
          if isinstance(e, httpx.HTTPStatusError):
               if e.response.status_code in [401, 403]:
                   raise Exception("Payment gateway authentication failed. Please contact support.") from e
@@ -451,11 +450,8 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
          return f"{ai_response_ack} I can help you:\n\n🛒 *Start a new grocery order:*\n Just say 'I want to buy...' or 'Show me the menu'.\n\n📦 *Check your order status:*\n Ask 'Where is my order?' or 'What is the status of my order?'.\n\n❌ *Cancel a pending order:*\n If you have an order waiting for payment, reply 'cancel'.\n\nWhat do you need assistance with today?"
 
     elif intent == "repeat":
-        # **IMPROVEMENT: Use contextual memory (last_bot_message)**
         last_msg = user.get('last_bot_message')
         if last_msg:
-            # Update user's last message to the "repeat" acknowledgement first? Or just repeat the original?
-            # Let's just repeat the original last message.
             return f"{ai_response_ack}\n\nI last said:\n> {last_msg}"
         else:
             return f"{ai_response_ack} I don't have a recent message to repeat right now."
@@ -606,12 +602,6 @@ async def whatsapp_webhook(request: Request):
              if active_pending_order and active_pending_order['status'] == DefaultStatus.ORDER_AWAITING_LOCATION:
                  logger.info(f"Processing expected location for order {active_pending_order['id']} from user {user_id}")
                  try:
-                    # **IMPROVEMENT: Send thinking indicator**
-                    if send_whatsapp_message_available:
-                         await send_whatsapp_message(from_number_clean, "Processing location...") # Async, won't block
-                    else:
-                         logger.warning("Cannot send thinking indicator, send_whatsapp_message not available.")
-
                     location_to_save = json.dumps({"latitude": str(latitude), "longitude": str(longitude)})
                     supabase.table("users").update({"last_known_location": location_to_save}).eq("id", user_id).execute()
                     logger.info(f"Saved location {latitude},{longitude} for user {user_id}")
@@ -644,10 +634,6 @@ async def whatsapp_webhook(request: Request):
              elif active_pending_order and active_pending_order['status'] == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
                   logger.info(f"User {user_id} sent location while order {active_pending_order['id']} is {DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION}. Treating as 'provide new'.")
                   try:
-                    # **IMPROVEMENT: Send thinking indicator**
-                    if send_whatsapp_message_available:
-                         await send_whatsapp_message(from_number_clean, "Processing location...")
-
                     location_to_save = json.dumps({"latitude": str(latitude), "longitude": str(longitude)})
                     supabase.table("users").update({"last_known_location": location_to_save}).eq("id", user_id).execute()
                     logger.info(f"Saved NEW location {latitude},{longitude} for user {user_id}")
@@ -700,7 +686,6 @@ async def whatsapp_webhook(request: Request):
                 if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
                      if lower_incoming_msg in ["1", "delivery"]:
                          handled_by_pending_state = True
-                         # Logic for selecting delivery - moved from handle_pending_order
                          if user.get("last_known_location"):
                              try:
                                 supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
@@ -729,12 +714,7 @@ async def whatsapp_webhook(request: Request):
 
                      elif lower_incoming_msg in ["2", "pickup"]:
                           handled_by_pending_state = True
-                          # Logic for selecting pickup - moved from handle_pending_order
                           try:
-                            # **IMPROVEMENT: Send thinking indicator**
-                            if send_whatsapp_message_available:
-                                await send_whatsapp_message(from_number_clean, "Setting up pickup order...")
-
                             supabase.table("orders").update({"delivery_type": "pickup", "status": DefaultStatus.ORDER_PENDING_PAYMENT, "updated_at": datetime.now().isoformat()}).eq("id", order_id).execute()
                             logger.info(f"Order {order_id} status updated to {DefaultStatus.ORDER_PENDING_PAYMENT} (pickup)")
                             payment_link = await generate_paystack_payment_link(order_id, active_pending_order['total_amount'], from_number_clean)
@@ -767,10 +747,6 @@ async def whatsapp_webhook(request: Request):
                                 reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
                         else:
                             try:
-                                # **IMPROVEMENT: Send thinking indicator**
-                                if send_whatsapp_message_available:
-                                     await send_whatsapp_message(from_number_clean, "Calculating delivery fee...")
-
                                 location_data = json.loads(location_str)
                                 latitude = float(location_data.get("latitude"))
                                 longitude = float(location_data.get("longitude"))
@@ -831,14 +807,12 @@ async def whatsapp_webhook(request: Request):
                             reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
 
                 # --- Handle Cancel Command ---
-                # Check for cancel *after* state-specific commands, but before general intent detection
                 if lower_incoming_msg == 'cancel':
                     handled_by_pending_state = True
                     if current_status in [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]:
                          reply_message = f"This order (ID: {order_id}) is already marked as *{current_status}* and cannot be cancelled."
                     else:
                          try:
-                            # **IMPROVEMENT: Include Order ID in cancellation confirmation**
                             supabase.table("orders").update({
                                 "status": DefaultStatus.ORDER_CANCELLED,
                                 "payment_status": DefaultStatus.PAYMENT_CANCELLED,
@@ -854,13 +828,6 @@ async def whatsapp_webhook(request: Request):
 
                 # --- Handle messages that are *not* state-specific commands ---
                 if not handled_by_pending_state:
-                    # User sent text that didn't match specific prompts for the pending state.
-                    # **IMPROVEMENT: Acknowledge new intent but remind about pending action**
-
-                    # Send thinking indicator before calling AI
-                    if send_whatsapp_message_available:
-                         await send_whatsapp_message(from_number_clean, "Thinking...")
-
                     user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
                     gemini_result = await call_gemini_intent_extraction(incoming_msg, user_context)
                     intent = gemini_result.get('intent')
@@ -887,12 +854,9 @@ async def whatsapp_webhook(request: Request):
                               reminder_message = f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment. Please reply 'cancel' if you don't want to proceed."
 
 
-                    # Construct the reply message: AI ack + reminder
                     if intent in ["greet", "thank_you", "help", "repeat"]:
-                         # These intents can be handled relatively independently, still remind about pending order
                          reply_message = ai_ack + reminder_message
                     elif intent in ["buy", "check_status"]:
-                         # Acknowledge the intent but emphasize the pending action first
                          action_needed = ""
                          if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION: action_needed = "choose delivery/pickup"
                          elif current_status in [DefaultStatus.ORDER_AWAITING_LOCATION, DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION]: action_needed = "provide delivery location"
@@ -901,27 +865,20 @@ async def whatsapp_webhook(request: Request):
                          if action_needed:
                               reply_message = f"{ai_ack} However, you currently have a pending order (ID: {order_id}) waiting for you to {action_needed}. Please complete that step first, or reply 'cancel'."
                          else:
-                              # Fallback if status is unexpected but order is pending
                               reply_message = f"{ai_ack} However, you have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
 
-                    else: # Unknown or other intents while pending
+                    else:
                          reply_message = f"I'm not sure how to help with that right now. You currently have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
-                         if reminder_message: # Add specific reminder if available
+                         if reminder_message:
                               reply_message += reminder_message
 
 
             else: # No active pending order
-                # **IMPROVEMENT: Send thinking indicator**
-                if send_whatsapp_message_available:
-                     await send_whatsapp_message(from_number_clean, "Thinking...")
-
                 user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
                 gemini_result = await call_gemini_intent_extraction(incoming_msg, user_context)
-                # **IMPROVEMENT: Pass is_new_user flag to handle_new_conversation**
                 reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user)
 
         else:
-             # Received an empty message or unhandled type after checking location/media
              logger.info(f"Received an empty or unhandled message type from user {user_id}.")
              if is_new_user:
                  reply_message = "👋 Welcome to Fresh Market GH!\n\nI can help you order fresh groceries.\n\nTo start, just say 'I want to buy...' or 'Show me the menu'."
@@ -936,8 +893,8 @@ async def whatsapp_webhook(request: Request):
              try:
                 await send_whatsapp_message(from_number_clean, reply_message)
                 logger.info(f"Sent reply to {from_number_clean}.")
-                # **IMPROVEMENT: Save the sent message as last_bot_message**
                 try:
+                    # Save the sent message as last_bot_message for 'repeat' intent
                     supabase.table("users").update({"last_bot_message": reply_message}).eq("id", user_id).execute()
                     logger.info(f"Saved last bot message for user {user_id}.")
                 except Exception as e:
@@ -952,14 +909,12 @@ async def whatsapp_webhook(request: Request):
 
     except Exception as e:
         logger.error(f"Unhandled critical error in whatsapp_webhook for user {from_number_clean}: {e}", exc_info=True)
-        # Send a generic error message only if we haven't sent one already
         if not reply_message and from_number_clean and send_whatsapp_message_available:
              try:
                 await send_whatsapp_message(from_number_clean, "Oh, something went wrong on my end. Please try again in a moment.")
              except Exception as send_e_2:
                  logger.error(f"Failed to send emergency error message to {from_number_clean}: {send_e_2}", exc_info=True)
 
-    # Always return 200 OK to the webhook provider
     return JSONResponse(content={}, status_code=status.HTTP_200_OK)
 
 
@@ -1047,7 +1002,6 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
             try:
                 await send_whatsapp_message(phone_number, delivery_msg)
                 logger.info(f"Sent confirmation message to user {user_id} ({phone_number}) for order {order_id}")
-                # **IMPROVEMENT: Save the sent message as last_bot_message**
                 try:
                     supabase.table("users").update({"last_bot_message": delivery_msg}).eq("id", user_id).execute()
                     logger.info(f"Saved last bot message for user {user_id} from /confirm-items.")
@@ -1166,7 +1120,6 @@ async def payment_success_webhook(request: Request):
                       notification_prefix = "❌ Payment Issue"
                       notification_suffix = " There was an issue with the payment amount received. Please contact support."
 
-            # **IMPROVEMENT: Explicitly handle charge.failed status from Paystack event**
             elif paystack_status == 'failed':
                  if current_payment_status not in [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID, DefaultStatus.PAYMENT_FAILED]:
                      new_payment_status = DefaultStatus.PAYMENT_FAILED
@@ -1223,7 +1176,6 @@ async def payment_success_webhook(request: Request):
                  try:
                      await send_whatsapp_message(phone_number, notification_message)
                      logger.info(f"Notified user {order['user_id']} ({phone_number}) about order {order_id} payment status '{new_payment_status}'.")
-                     # **IMPROVEMENT: Save the sent message as last_bot_message**
                      try:
                          supabase.table("users").update({"last_bot_message": notification_message}).eq("id", order['user_id']).execute()
                          logger.info(f"Saved last bot message for user {order['user_id']} from /payment-success.")
@@ -1234,7 +1186,7 @@ async def payment_success_webhook(request: Request):
                       logger.error(f"Failed to send WhatsApp notification for paid order {order_id} to {phone_number}: {e}", exc_info=True)
 
              elif not send_whatsapp_message_available:
-                 logger.error(f"send_whatsapp_message is not available. Cannot notify user {order['user_id']} about order {order_id}.")
+                 logger.error(f"send_whatsapp_message is not available. Cannot notify user {order['user_id']} about order {order_id}")
              else:
                  logger.error(f"Could not find user {order['user_id']} to notify for order {order_id}")
 
