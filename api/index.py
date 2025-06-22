@@ -541,47 +541,35 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
                 total_display = latest_order.get('total_with_delivery') or latest_order.get('total_amount')
                 total_display_formatted = f"{total_display:.2f}" if total_display is not None else "N/A"
 
-                status_display = current_order_status.replace('-', ' ').title()
-                delivery_type_display = delivery_type.replace('_', ' ').title()
+                # Build a more conversational, status-specific message
+                reply_message = f"{ai_response_ack} " # Start with the AI acknowledgement
 
-                # Build a status-specific message
-                reply_message = f"{ai_response_ack} Your latest active order ({order_number}) is currently *{status_display}* ({delivery_type_display})."
-
-                # Add more context based on specific status
                 if current_order_status == DefaultStatus.ORDER_PROCESSING:
-                    reply_message += "\nWe are currently preparing your items."
                     if delivery_type == 'delivery':
-                         reply_message += " We'll notify you once it's out for delivery."
+                        reply_message += f"Your order *{order_number}* is currently being prepared. We'll notify you as soon as it's out for delivery!"
+                    else: # pickup
+                        reply_message += f"Your order *{order_number}* is currently being prepared for pickup. We'll send you a message the moment it's ready!"
                 elif current_order_status == DefaultStatus.ORDER_OUT_FOR_DELIVERY:
-                     reply_message += "\nYour order is out for delivery!"
-                     # TODO: Add estimated time or tracking link if available in DB/system
+                     reply_message += f"Great news! Your order *{order_number}* is out for delivery and should be with you soon."
                 elif current_order_status == DefaultStatus.ORDER_DELIVERED:
-                     # Although filtered out by not_.in_, handle defensively (shouldn't happen here)
-                     reply_message = f"{ai_response_ack} Your latest order ({order_number}) was delivered."
+                     # This case is primarily handled by the 'else' block below, but here for defense
+                     reply_message += f"Your latest order ({order_number}) has already been delivered."
                 elif current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT:
-                     # Although filtered out by payment_status check, handle defensively
-                     reply_message = f"{ai_response_ack} You have a pending order ({order_number}) waiting for payment. Total: GHS {total_display_formatted}."
-                     # Could add payment link here, but this branch is for *paid* orders primarily
-
-                # Check if the user specifically asked about payment or pickup within the check_status intent (Less likely for paid orders, but possible)
-                lower_original_message = original_message.lower()
-                # Re-check if the user specifically asked about pickup for a processing pickup order
-                if current_order_status == DefaultStatus.ORDER_PROCESSING and delivery_type == 'pickup' and ("pickup" in lower_original_message or "collect" in lower_original_message or "when can i come" in lower_original_message or "ready" in lower_original_message):
-                     # If pickup is processing, provide info if ready
-                     # TODO: This requires logic to determine if a processing pickup order is *actually* ready. This usually comes from an internal update (admin panel). For now, give a generic 'processing' pickup message.
-                     reply_message += "\nWe'll notify you as soon as your pickup order is ready for collection."
-                elif current_order_status == DefaultStatus.ORDER_OUT_FOR_DELIVERY and delivery_type == 'delivery' and ("when will it arrive" in lower_original_message or "where is it" in lower_original_message):
-                     reply_message += "\nYour driver is on the way!" # Could add ETA or tracking link here if available
-
+                     # This case should be rare for paid orders, but here for defense
+                     reply_message += f"You have a pending order ({order_number}) waiting for payment. Total: GHS {total_display_formatted}."
+                else: # A fallback for any other active statuses
+                    status_display = current_order_status.replace('-', ' ').title()
+                    delivery_type_display = delivery_type.replace('_', ' ').title()
+                    reply_message += f"Your latest active order ({order_number}) is currently *{status_display}* ({delivery_type_display})."
 
             else:
                 # No active paid orders found, check for a recent delivered one
                 recent_delivered_res = supabase.table("orders").select("id, order_number").eq("user_id", user_id).eq("status", DefaultStatus.ORDER_DELIVERED).order("created_at", desc=True).limit(1).execute()
                 if recent_delivered_res.data:
                     order_number = recent_delivered_res.data[0].get('order_number', recent_delivered_res.data[0]['id'])
-                    reply_message = f"{ai_response_ack} Your latest order ({order_number}) has already been delivered. Can I help you start a new one?"
+                    reply_message = f"{ai_response_ack} Your latest order ({order_number}) has already been delivered. Would you like to start a new one?"
                 else:
-                     reply_message = f"{ai_response_ack} It looks like you don't have any active orders right now. Can I help you start a new one?"
+                     reply_message = f"{ai_response_ack} It looks like you don't have any active orders right now. Would you like to place one?"
         except Exception as e:
             logger.error(f"Error checking order status for user {user_id}: {e}", exc_info=True)
             reply_message = f"{ai_response_ack} I'm having trouble looking up your order details right now. Please try again in a moment."
