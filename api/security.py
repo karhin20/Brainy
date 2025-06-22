@@ -85,3 +85,24 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
         ) 
+
+async def get_admin_user(user: dict = Depends(verify_jwt)):
+    """
+    Depends on verify_jwt, then checks if the user has admin privileges.
+    Admin role is expected to be in the 'app_metadata' of the JWT.
+    """
+    app_metadata = user.get('app_metadata', {})
+    
+    # Check for 'admin' in a list of roles or if a single role field is 'admin'
+    user_roles = app_metadata.get('roles', [])
+    user_role = app_metadata.get('role', '')
+
+    if 'admin' not in user_roles and user_role != 'admin':
+        logger.warning(f"Admin access denied for user {user.get('id')}. Roles: {user_roles}, Role: '{user_role}'")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this resource."
+        )
+    
+    logger.info(f"Admin access granted for user {user.get('id')}.")
+    return user 
