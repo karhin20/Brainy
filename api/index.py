@@ -425,11 +425,11 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     intent = intent_data.get("intent")
     ai_response_ack = intent_data.get("response", "Okay.")
 
-    logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}. Message: '{original_message}'") # CORRECTED LOGGING
+    logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}. Message: '{original_message}'")
 
     if intent == "buy":
         session_token = str(uuid.uuid4())
-        selection_url = f"{settings.FRONTEND_URL}?session={session_token}"
+        selection_url = f"{settings.FRONTEND_URL}/menu?session={session_token}"
         try:
             supabase.table("sessions").insert({
                 "user_id": user_id,
@@ -454,15 +454,62 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     elif intent == "check_status":
         try:
-            active_paid_orders_res = supabase.table("orders").select("status, id, delivery_type").eq("user_id", user_id).in_("payment_status", [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]).not_.in_("status", [DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
+            # Look for the latest paid order that's not cancelled or delivered.
+            # Select ALL relevant fields including status, type, fees, location if available
+            active_paid_orders_res = supabase.table("orders").select("status, id, delivery_type, delivery_fee, total_amount, total_with_delivery, delivery_location_lat, delivery_location_lon").eq("user_id", user_id).in_("payment_status", [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]).not_.in_("status", [DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
 
-            # **APPLIED TO CHECK_STATUS:** Combine AI acknowledgement with status message
+            # **APPLIED TO CHECK_STATUS:** Provide detailed message based on the found order's specific status
             if active_paid_orders_res.data:
                 latest_order = active_paid_orders_res.data[0]
-                status_display = latest_order['status'].replace('-', ' ').title()
-                delivery_type = latest_order.get('delivery_type', 'N/A').title()
-                return f"{ai_response_ack} Your latest active order (ID: {latest_order['id']}) status is: *{status_display}* ({delivery_type})."
+                order_id = latest_order['id']
+                current_order_status = latest_order['status']
+                delivery_type = latest_order.get('delivery_type', 'N/A')
+                total_display = latest_order.get('total_with_delivery') or latest_order.get('total_amount')
+
+                status_display = current_order_status.replace('-', ' ').title()
+                delivery_type_display = delivery_type.title()
+
+                # Build a status-specific message
+                status_message = f"{ai_response_ack} Your latest active order (ID: {order_id}) is currently *{status_display}* ({delivery_type_display})."
+
+                if current_order_status == DefaultStatus.ORDER_PROCESSING:
+                    status_message += "\nWe are currently preparing your items."
+                    if delivery_type == 'delivery':
+                         status_message += " We'll notify you once it's out for delivery."
+                elif current_order_status == DefaultStatus.ORDER_OUT_FOR_DELIVERY:
+                     status_message += "\nYour order is out for delivery!"
+                     # Add estimated time or tracking link if available in DB
+                elif current_order_status == DefaultStatus.ORDER_DELIVERED:
+                     # Although filtered out by not_.in_, handle defensively
+                     status_message = f"{ai_response_ack} Your latest order (ID: {order_id}) was delivered."
+                elif current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT:
+                     # Although filtered out by payment_status check, handle defensively
+                     status_message = f"{ai_response_ack} You have a pending order (ID: {order_id}) waiting for payment. Total: GHS {total_display:.2f}."
+                     # Could add payment link here, but this branch is for paid orders primarily
+
+                # Check if the user specifically asked about payment or pickup within the check_status intent
+                lower_original_message = original_message.lower()
+                if current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT and ("paid" in lower_original_message or "payment" in lower_original_message):
+                     status_message = f"{ai_response_ack} I'm checking for payment confirmation for your order (ID: {order_id}). Its current status is still *{status_display}* ({delivery_type_display}). Please allow a few minutes for the payment to reflect. If you paid recently and the status doesn't update, please contact support."
+                elif current_order_status == DefaultStatus.ORDER_AWAITING_LOCATION and ("location" in lower_original_message or "address" in lower_original_message):
+                      status_message = f"{ai_response_ack} I see your order (ID: {order_id}) is waiting for your delivery location. Please share it using the WhatsApp location feature."
+                elif current_order_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION and ("location" in lower_original_message or "address" in lower_original_message):
+                      status_message = f"{ai_response_ack} I see your order (ID: {order_id}) is waiting for you to confirm your saved location or provide a new one."
+                elif current_order_status == DefaultStatus.ORDER_PENDING_PAYMENT and delivery_type == 'pickup' and ("pickup" in lower_original_message or "collect" in lower_original_message or "when can i come" in lower_original_message):
+                      # If pickup is awaiting payment, remind them to pay first
+                      status_message = f"{ai_response_ack} Your pickup order (ID: {order_id}) is waiting for payment. Total: GHS {total_display:.2f}. Please complete payment to confirm pickup."
+                elif current_order_status == DefaultStatus.ORDER_PROCESSING and delivery_type == 'pickup' and ("pickup" in lower_original_message or "collect" in lower_original_message or "when can i come" in lower_original_message or "ready" in lower_original_message):
+                     # If pickup is processing, provide info if ready
+                     # **NOTE:** This requires logic to determine if a processing pickup order is *actually* ready. This usually comes from an internal update (admin panel). For now, give a generic 'processing' pickup message.
+                     status_message = f"{ai_response_ack} Your pickup order (ID: {order_id}) is currently being prepared. We'll notify you as soon as it's ready for collection."
+                elif current_order_status == DefaultStatus.ORDER_OUT_FOR_DELIVERY and delivery_type == 'delivery' and ("when will it arrive" in lower_original_message or "where is it" in lower_original_message):
+                     status_message = f"{ai_response_ack} Your delivery order (ID: {order_id}) is out for delivery!" # Could add ETA or tracking link here if available
+
+
+                return status_message # Return the detailed status message
+
             else:
+                # No active paid orders found, check for a recent delivered one
                 recent_delivered_res = supabase.table("orders").select("id").eq("user_id", user_id).eq("status", DefaultStatus.ORDER_DELIVERED).order("created_at", desc=True).limit(1).execute()
                 if recent_delivered_res.data:
                     return f"{ai_response_ack} Your latest order (ID: {recent_delivered_res.data[0]['id']}) has already been delivered. Can I help you start a new one?"
@@ -478,6 +525,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     elif intent == "greet":
         # **APPLIED TO GREET:** Combine AI acknowledgement with the welcome/welcome back message
+        # This part looks correct now based on the desired output
         if is_new_user:
             return (
                 f"{ai_response_ack}\n\n" # E.g., "Hello! How can I assist you today?"
@@ -487,10 +535,8 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         else:
             user_name = user.get('name')
             greeting_name = f", {user_name}!" if user_name else "!"
-            return (
-                 f"{ai_response_ack}{greeting_name} " # E.g., "Hello! How can I assist you today, Kofi!"
-                 "How can I help you with your groceries today?"
-            )
+            # Ensure only one greeting part
+            return f"{ai_response_ack}{greeting_name} How can I help you with your groceries today?"
 
 
     elif intent == "help":
@@ -936,6 +982,7 @@ async def whatsapp_webhook(request: Request):
             else: # No active pending order
                 user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
                 gemini_result = await get_intent_gracefully(incoming_msg, user_context)
+                # Passing incoming_msg to handle_new_conversation for logging/context
                 reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg)
 
         else:
@@ -970,6 +1017,7 @@ async def whatsapp_webhook(request: Request):
 
 
     except Exception as e:
+        # This catch-all should now only be for truly unexpected errors outside the AI call handling
         logger.error(f"Unhandled critical error in whatsapp_webhook for user {from_number_clean}: {e}", exc_info=True)
         if not reply_message and from_number_clean and send_whatsapp_message_available:
              try:

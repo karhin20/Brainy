@@ -1,3 +1,5 @@
+import os
+import httpx
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import logging
@@ -12,6 +14,9 @@ router = APIRouter(
     tags=["authentication"]
 )
 logger = logging.getLogger(__name__)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_KEY")
 
 class AuthRequest(BaseModel):
     email: str
@@ -39,18 +44,27 @@ async def signup(request: AuthRequest, db: SupabaseClient = Depends(lambda: supa
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/login")
-async def login(request: AuthRequest, db: SupabaseClient = Depends(lambda: supabase)):
+async def login(request: AuthRequest):
     """
     Logs in an admin user and returns a session object containing the JWT access token.
     """
-    if not db:
-        raise HTTPException(status_code=500, detail="Database connection not available")
     try:
-        session = db.auth.sign_in_with_password({
-            "email": request.email,
-            "password": request.password
-        })
-        return session
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "email": request.email,
+                    "password": request.password
+                }
+            )
+            if response.status_code != 200:
+                logger.error(f"Supabase Auth error: {response.text}")
+                raise HTTPException(status_code=401, detail="Invalid login credentials.")
+            return response.json()
     except Exception as e:
         logger.error(f"Error during login: {e}", exc_info=True)
-        raise HTTPException(status_code=401, detail="Invalid login credentials.") 
+        raise HTTPException(status_code=500, detail="Internal server error during login.")
