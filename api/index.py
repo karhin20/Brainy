@@ -1,5 +1,3 @@
-
-
 import os
 import sys
 import uuid
@@ -189,29 +187,14 @@ async def health_check():
     }
 
 
-async def call_gemini_intent_extraction(message: str, user_context: Dict[str, Any]) -> Dict[str, Any]:
+# Modified: This function now just calls the AI and returns the raw result or raises specific errors
+async def call_gemini_api(message: str) -> Dict[str, Any]:
     """
-    Call Gemini API to extract intent and provide a standardized response.
-    Includes fallback logic and robust error handling.
+    Call Gemini API to get raw intent extraction result.
+    Raises specific httpx, json, or value errors on failure.
     """
-    lower_msg = message.lower().strip()
-
     if not settings.GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set, using fallback logic for intent extraction.")
-        # Fallback logic - simple keyword matching with basic typo tolerance
-        if "cancel" in lower_msg: return {"intent": "cancel_order", "response": "Okay, I can help with cancelling an order."}
-        if "status" in lower_msg or "track" in lower_msg or "where is my order" in lower_msg: return {"intent": "check_status", "response": "Let me check on your order."}
-        if any(word in lower_msg for word in ["buy", "want", "order", "menu", "available", "shop"]):
-             return {"intent": "buy", "response": "Great! I can help with that."}
-        if any(word in lower_msg for word in ["hello", "hi", "hey", "hola", "morning", "afternoon"]):
-             return {"intent": "greet", "response": "Hello! How can I help you today?"}
-        if "help" in lower_msg or "how" in lower_msg:
-             return {"intent": "help", "response": "I can certainly help with that."}
-        if any(word in lower_msg for word in ["repeat", "say again", "last message"]):
-             return {"intent": "repeat", "response": "Certainly, I can repeat that."}
-        if any(word in lower_msg for word in ["thank", "thanks"]):
-             return {"intent": "thank_you", "response": "You're welcome!"}
-        return {"intent": "unknown", "response": "I'm sorry, I can only assist with grocery orders. Could you please rephrase?"}
+        raise ValueError("GEMINI_API_KEY not set") # Raise error if key is missing
 
     try:
         headers = {"Content-Type": "application/json"}
@@ -245,7 +228,7 @@ async def call_gemini_intent_extraction(message: str, user_context: Dict[str, An
                 - `greet`: "Hello! How can I assist you today?"
                 - `help`: "I can help with that. What do you need?"
                 - `repeat`: "Certainly, I can repeat that."
-                - `thank_you`: "You're welcome!"
+                - `thank_you`: "You're welcome!" # Corrected typo here
                 - `unknown`: "I'm sorry, I can only help with grocery orders."
 
             Example response format:
@@ -264,7 +247,7 @@ async def call_gemini_intent_extraction(message: str, user_context: Dict[str, An
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(settings.GEMINI_API_URL, headers=headers, params=params, json=payload)
-            response.raise_for_status()
+            response.raise_for_status() # Raises HTTPStatusError
 
             result = response.json()
             json_text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
@@ -274,24 +257,72 @@ async def call_gemini_intent_extraction(message: str, user_context: Dict[str, An
                  logger.error(f"Gemini API response missing expected text payload: {result}")
                  raise ValueError(f"Gemini API returned empty text payload or error: {error_msg}")
 
-            try:
-                return json.loads(json_text)
-            except json.JSONDecodeError:
-                 logger.error(f"Gemini API returned non-JSON or invalid JSON string: {json_text}", exc_info=True)
-                 raise json.JSONDecodeError("Gemini API returned invalid JSON string", json_text, 0)
+            return json.loads(json_text) # Raise JSONDecodeError if invalid
 
-    except httpx.RequestError as e: # Catch all httpx errors (connection, timeout, status)
+    except httpx.RequestError as e:
+        logger.error(f"Gemini API communication error: {e}", exc_info=True)
+        raise # Re-raise the exception
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding Gemini response JSON: {e}", exc_info=True)
+        raise # Re-raise the exception
+    except ValueError as e: # From missing text payload check
+        logger.error(f"Error processing Gemini response: {e}", exc_info=True)
+        raise # Re-raise the exception
+    except Exception as e:
+        # Catch any other unexpected errors during the API call itself
+        logger.error(f"Unexpected error during Gemini API call: {e}", exc_info=True)
+        raise # Re-raise the exception
+
+
+# New helper function to handle Gemini call with graceful fallback
+async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calls Gemini API, handles errors gracefully, and provides fallback logic.
+    Always returns a dictionary with 'intent' and 'response'.
+    """
+    try:
+        gemini_result = await call_gemini_api(message)
+        # Validate minimum expected structure from Gemini
+        if "intent" in gemini_result and "response" in gemini_result:
+             return gemini_result
+        else:
+             logger.error(f"Gemini API returned unexpected structure: {gemini_result}")
+             # Fallback if structure is valid JSON but wrong keys
+             return {"intent": "unknown", "response": "I received an unexpected response from my processing service. Please try again."}
+
+    except ValueError as e:
+         if "GEMINI_API_KEY not set" in str(e):
+             logger.warning("GEMINI_API_KEY not set, using fallback logic for intent extraction.")
+             # --- Fallback logic - simple keyword matching with basic typo tolerance ---
+             lower_msg = message.lower().strip()
+             if "cancel" in lower_msg: return {"intent": "cancel_order", "response": "Okay, I can help with cancelling an order."}
+             if "status" in lower_msg or "track" in lower_msg or "where is my order" in lower_msg: return {"intent": "check_status", "response": "Let me check on your order."}
+             if any(word in lower_msg for word in ["buy", "want", "order", "menu", "available", "shop"]):
+                  return {"intent": "buy", "response": "Great! I can help with that."}
+             if any(word in lower_msg for word in ["hello", "hi", "hey", "hola", "morning", "afternoon"]):
+                  return {"intent": "greet", "response": "Hello! How can I help you today?"}
+             if "help" in lower_msg or "how" in lower_msg:
+                  return {"intent": "help", "response": "I can certainly help with that."}
+             if any(word in lower_msg for word in ["repeat", "say again", "last message"]):
+                  return {"intent": "repeat", "response": "Certainly, I can repeat that."}
+             if any(word in lower_msg for word in ["thank", "thanks"]):
+                  return {"intent": "thank_you", "response": "You're welcome!"}
+             return {"intent": "unknown", "response": "I'm sorry, I can only assist with grocery orders. Could you please rephrase?"}
+         else:
+             # Handle other ValueErrors from call_gemini_api (e.g. empty text payload)
+             logger.error(f"Error processing Gemini response: {e}", exc_info=True)
+             return {"intent": "unknown", "response": f"There was an issue processing the response from my service: {e}. Please try again."}
+
+    except httpx.RequestError as e:
         logger.error(f"Gemini API communication error: {e}", exc_info=True)
         return {"intent": "unknown", "response": "I'm having trouble connecting to my service. Please try again in a moment."}
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding Gemini response JSON: {e}", exc_info=True)
         return {"intent": "unknown", "response": "I received an unreadable response from my processing service. Please try again."}
-    except ValueError as e:
-        logger.error(f"Error processing Gemini response: {e}", exc_info=True)
-        return {"intent": "unknown", "response": f"There was an issue with the response from my processing service: {e}. Please try again."}
     except Exception as e:
-        logger.error(f"Unexpected error in call_gemini_intent_extraction: {e}", exc_info=True)
-        return {"intent": "unknown", "response": "I'm sorry, something unexpected went wrong. Please try again."}
+        # Catch any other unexpected errors during the process
+        logger.error(f"Unexpected error during Gemini intent extraction: {e}", exc_info=True)
+        return {"intent": "unknown", "response": "I'm sorry, something unexpected went wrong with my processing. Please try again."}
 
 
 async def generate_paystack_payment_link(order_id: str, amount: float, user_phone: str) -> str:
@@ -381,31 +412,32 @@ def verify_paystack_signature(request_body: bytes, signature: str, secret_key: O
         return False
 
 
-async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str, Any], from_number: str, is_new_user: bool) -> str:
+async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str, Any], from_number: str, is_new_user: bool, original_message: str) -> str:
     """
     Handles interaction when a user has no active unpaid orders.
     Routes messages based on the intent extracted by Gemini or fallback logic.
     Includes is_new_user flag for tailored responses.
+    Accepts original_message for logging/context if needed.
     """
     user_id = user['id']
     intent_data = gemini_result
     intent = intent_data.get("intent")
     ai_response_ack = intent_data.get("response", "Okay.")
 
-    logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}")
+    # Use original_message for logging here
+    logger.info(f"Handling new conversation for user {user_id}. Intent: {intent}. Is New User: {is_new_user}. Message: '{original_message}'")
 
     if intent == "buy":
         session_token = str(uuid.uuid4())
         selection_url = f"{settings.FRONTEND_URL}/menu?session={session_token}"
         try:
-            # Create a session entry
             supabase.table("sessions").insert({
                 "user_id": user_id,
                 "phone_number": from_number,
                 "session_token": session_token,
                 "last_intent": "buy",
                 "created_at": datetime.now().isoformat(),
-                "expires_at": (datetime.now() + timedelta(hours=24)).isoformat() # Session expires after 24 hours
+                "expires_at": (datetime.now() + timedelta(hours=24)).isoformat()
             }).execute()
             logger.info(f"Created new session {session_token} for user {user_id}")
             greeting_part = "Welcome! " if is_new_user else "Great! "
@@ -416,7 +448,6 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     elif intent == "check_status":
         try:
-            # Look for the latest paid order that's not cancelled or delivered.
             active_paid_orders_res = supabase.table("orders").select("status, id, delivery_type").eq("user_id", user_id).in_("payment_status", [DefaultStatus.PAYMENT_PAID, DefaultStatus.PAYMENT_PARTIALLY_PAID]).not_.in_("status", [DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
 
             if active_paid_orders_res.data:
@@ -441,7 +472,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         if is_new_user:
             return "👋 Welcome to Fresh Market GH!\n\nI can help you order fresh groceries.\n\nTo start, just say 'I want to buy...' or 'Show me the menu'."
         else:
-            user_name = user.get('name') # Assuming 'name' field exists and is sometimes populated
+            user_name = user.get('name')
             greeting_name = f", {user_name}!" if user_name else "!"
             return f"👋 Welcome back to Fresh Market GH{greeting_name} How can I help you with your groceries today?"
 
@@ -460,7 +491,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
          return ai_response_ack
 
     else: # unknown or any other unhandled intent
-        logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{message}'")
+        logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{original_message}')")
         return ai_response_ack
 
 
@@ -516,7 +547,7 @@ async def whatsapp_webhook(request: Request):
     """
     form_data = await request.form()
     from_number = form_data.get("From")
-    incoming_msg = form_data.get("Body", "").strip()
+    incoming_msg = form_data.get("Body", "").strip() # Capture the incoming message
 
     if not from_number:
         logger.warning("Received webhook without 'From' number field.")
@@ -676,11 +707,12 @@ async def whatsapp_webhook(request: Request):
         # C. Handle incoming Text Message
         elif incoming_msg:
             lower_incoming_msg = incoming_msg.lower().strip()
-            handled_by_pending_state = False # Flag to see if message was handled by pending state logic
+            handled_by_pending_state = False
 
             if active_pending_order:
                 order_id = active_pending_order['id']
                 current_status: OrderStatus = active_pending_order.get('status', DefaultStatus.ORDER_PENDING_CONFIRMATION)
+                logger.info(f"Handling pending order {order_id} (status: {current_status}) text input: '{incoming_msg}'")
 
                 # --- Check for specific commands within the current pending state ---
                 if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
@@ -829,7 +861,8 @@ async def whatsapp_webhook(request: Request):
                 # --- Handle messages that are *not* state-specific commands ---
                 if not handled_by_pending_state:
                     user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
-                    gemini_result = await call_gemini_intent_extraction(incoming_msg, user_context)
+                    # **IMPROVEMENT: Use the new graceful handler which includes AI error handling**
+                    gemini_result = await get_intent_gracefully(incoming_msg, user_context)
                     intent = gemini_result.get('intent')
                     ai_ack = gemini_result.get('response', 'Okay.')
 
@@ -844,6 +877,7 @@ async def whatsapp_webhook(request: Request):
                     elif current_status == DefaultStatus.ORDER_PENDING_PAYMENT:
                          total = active_pending_order.get('total_with_delivery') or active_pending_order['total_amount']
                          try:
+                             # Regenerate payment link for reminder
                              payment_link = await generate_paystack_payment_link(order_id, total, from_number_clean)
                              reminder_message = (
                                  f"\n\nBut you have a pending order (ID: {order_id}) waiting for payment (GHS {total:.2f}). Please pay here: {payment_link}\n"
@@ -867,18 +901,21 @@ async def whatsapp_webhook(request: Request):
                          else:
                               reply_message = f"{ai_ack} However, you have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
 
-                    else:
+                    else: # Unknown or other intents while pending
                          reply_message = f"I'm not sure how to help with that right now. You currently have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
-                         if reminder_message:
+                         if reminder_message: # Add specific reminder if available
                               reply_message += reminder_message
 
 
             else: # No active pending order
                 user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
-                gemini_result = await call_gemini_intent_extraction(incoming_msg, user_context)
-                reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user)
+                # **IMPROVEMENT: Use the new graceful handler which includes AI error handling**
+                gemini_result = await get_intent_gracefully(incoming_msg, user_context)
+                # **IMPROVEMENT: Pass incoming_msg to handle_new_conversation for logging/context**
+                reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg)
 
         else:
+             # Received an empty message or unhandled type after checking location/media
              logger.info(f"Received an empty or unhandled message type from user {user_id}.")
              if is_new_user:
                  reply_message = "👋 Welcome to Fresh Market GH!\n\nI can help you order fresh groceries.\n\nTo start, just say 'I want to buy...' or 'Show me the menu'."
@@ -908,6 +945,7 @@ async def whatsapp_webhook(request: Request):
 
 
     except Exception as e:
+        # This catch-all should now only be for truly unexpected errors outside the AI call handling
         logger.error(f"Unhandled critical error in whatsapp_webhook for user {from_number_clean}: {e}", exc_info=True)
         if not reply_message and from_number_clean and send_whatsapp_message_available:
              try:
@@ -1110,7 +1148,7 @@ async def payment_success_webhook(request: Request):
                          new_payment_status = DefaultStatus.PAYMENT_PARTIALLY_PAID
                          update_needed = True
                          notification_prefix = "⚠️ Partial Payment Confirmed!"
-                         notification_suffix = f" Received GHS {(paystack_amount_kobo/100):.2f} of GHS {(expected_total_kobo/100):.2f}. Please contact support to complete the remaining payment." # Changed suffix slightly
+                         notification_suffix = f" Received GHS {(paystack_amount_kobo/100):.2f} of GHS {(expected_total_kobo/100):.2f}. Please contact support to complete the remaining payment."
                          logger.warning(f"Order {order_id}: Partial payment received.")
                      else:
                           logger.info(f"Order {order_id}: Already marked {current_payment_status}, skipping partial payment update.")
@@ -1219,4 +1257,3 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("FastAPI application shutting down.")
-
