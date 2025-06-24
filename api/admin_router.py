@@ -348,7 +348,9 @@ async def update_order_status(order_id: str, status_update: OrderStatusUpdate):
         # Notify the customer via WhatsApp
         if updated_order and updated_order.get("user"):
             phone_number = updated_order["user"]["phone_number"]
-            message = f"Good news! Your order ({order_id[:8]}...) is now *{status_update.status}*."
+            # Use order_number if available, otherwise fallback to truncated ID
+            display_order_id = updated_order.get('order_number') or f"{order_id[:8]}..."
+            message = f"Good news! Your order ({display_order_id}) is now *{status_update.status}*."
             await send_whatsapp_message(phone_number, message)
         
         return updated_order
