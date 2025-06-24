@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from typing import List
+from typing import List, Dict
 import logging
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -418,4 +418,28 @@ async def change_password(request: PasswordChangeRequest, current_user: dict = D
         # Attempt to provide more specific error messages if possible
         if "Invalid email or password" in str(e): # Example of catching specific errors
             raise HTTPException(status_code=400, detail="Invalid current password.")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred while changing password.") 
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while changing password.")
+
+# Pydantic model for Admin profile response (can reuse AdminUser if it fits or create a new one)
+class AdminProfileResponse(BaseModel):
+    id: str
+    phone_number: str
+    email: str | None = None # Supabase user might have email
+    admin_profile: Dict[str, str] | None = None # This will contain full_name and avatar_url
+
+@router.get("/me", response_model=AdminProfileResponse)
+async def get_current_admin_user(current_user: dict = Depends(security.get_admin_user)):
+    """
+    Retrieve details of the currently authenticated admin user, including their profile.
+    The `security.get_admin_user` dependency already fetches and attaches the admin_profile.
+    """
+    # Ensure items_json is a list, not a string, for AdminOrder response model
+    if 'items_json' in current_user and isinstance(current_user['items_json'], str):
+        try:
+            current_user['items_json'] = json.loads(current_user['items_json'])
+        except Exception as e:
+            logger.error(f"Failed to parse items_json for admin user {current_user.get('id')}: {e}")
+            current_user['items_json'] = [] # Fallback to empty list if parsing fails
+
+    # Return the current_user object which now contains the admin_profile
+    return current_user 

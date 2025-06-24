@@ -90,6 +90,7 @@ async def get_admin_user(user: dict = Depends(verify_jwt)):
     """
     Depends on verify_jwt, then checks if the user has admin privileges.
     Admin role is expected to be in the 'app_metadata' of the JWT.
+    Additionally fetches admin_profile information if available.
     """
     app_metadata = user.get('app_metadata', {})
     
@@ -105,4 +106,22 @@ async def get_admin_user(user: dict = Depends(verify_jwt)):
         )
     
     logger.info(f"Admin access granted for user {user.get('id')}.")
+
+    # Fetch admin profile data
+    if supabase:
+        try:
+            profile_res = await supabase.table("admin_profiles").select("full_name, avatar_url").eq("user_id", user['id']).limit(1).execute()
+            if profile_res.data:
+                user["admin_profile"] = profile_res.data[0]
+                logger.info(f"Attached admin profile for user {user['id']}.")
+            else:
+                user["admin_profile"] = None # No profile found
+                logger.info(f"No admin profile found for user {user['id']}.")
+        except Exception as e:
+            logger.error(f"Failed to fetch admin profile for user {user['id']}: {e}", exc_info=True)
+            user["admin_profile"] = None # Ensure profile is set to None on error
+    else:
+        logger.warning("Supabase client not available, skipping admin profile fetch.")
+        user["admin_profile"] = None
+
     return user 
