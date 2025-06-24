@@ -337,6 +337,14 @@ async def update_order_status(order_id: str, status_update: OrderStatusUpdate):
         fetch_res = supabase.table("orders").select("*, user:users(phone_number)").eq("id", order_id).single().execute()
         updated_order = fetch_res.data
         
+        # Ensure items_json is a list, not a string, for the response model
+        if updated_order and 'items_json' in updated_order and isinstance(updated_order['items_json'], str):
+            try:
+                updated_order['items_json'] = json.loads(updated_order['items_json'])
+            except Exception as e:
+                logger.error(f"Failed to parse items_json for updated order {updated_order.get('id')}: {e}")
+                updated_order['items_json'] = [] # Fallback to empty list if parsing fails
+
         # Notify the customer via WhatsApp
         if updated_order and updated_order.get("user"):
             phone_number = updated_order["user"]["phone_number"]
