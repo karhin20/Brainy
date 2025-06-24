@@ -141,7 +141,7 @@ app = FastAPI(
 # --- Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Restrict this in production
+    allow_origins=["*", "http://localhost:8080"], # Restrict this in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
