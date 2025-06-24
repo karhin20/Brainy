@@ -1197,6 +1197,10 @@ async def whatsapp_webhook(request: Request):
 # --- Frontend/API Endpoints ---
 # (These endpoints remain largely the same as they are called from the frontend, not chat)
 
+def generate_order_number():
+    # Example: ORD-<timestamp>
+    return f"ORD-{int(datetime.now(timezone.utc).timestamp())}"
+
 @app.post("/confirm-items")
 async def confirm_items(request: OrderRequest, api_key: str = Depends(security.verify_api_key)):
     """
@@ -1263,7 +1267,7 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
 
         # 3. Create the new order
         items_dict = [item.model_dump() for item in request.items] # Use model_dump() for Pydantic v2+
-
+        order_number = generate_order_number()
         order_data = {
             "user_id": user_id,
             "items_json": items_dict,
@@ -1271,7 +1275,8 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
             "status": DefaultStatus.ORDER_PENDING_CONFIRMATION, # Initial status
             "payment_status": DefaultStatus.PAYMENT_UNPAID,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "order_number": order_number,
         }
 
         try:

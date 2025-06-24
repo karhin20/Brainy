@@ -252,11 +252,17 @@ async def get_dashboard_charts_data():
             for order in all_paid_orders_res.data:
                 items = order.get("items_json") or []
                 for item in items:
-                    product_id = item.get("product_id")
-                    quantity = item.get("quantity")
-                    if product_id and quantity:
-                        product_counts[product_id] += quantity
-                        product_ids.add(product_id)
+                    if isinstance(item, str):
+                        try:
+                            item = json.loads(item)
+                        except Exception:
+                            continue
+                    if isinstance(item, dict):
+                        product_id = item.get("product_id")
+                        quantity = item.get("quantity")
+                        if product_id and quantity:
+                            product_counts[product_id] += quantity
+                            product_ids.add(product_id)
         
         top_products_data = []
         if product_ids:
