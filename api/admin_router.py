@@ -46,6 +46,7 @@ class AdminOrder(BaseModel):
     total_with_delivery: float | None = None
     items_json: List[AdminOrderItem]
     user: UserInfo | None = None
+    order_number: str | None = None
 
 
 @router.get("/orders", response_model=List[AdminOrder])
