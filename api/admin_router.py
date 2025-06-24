@@ -4,6 +4,7 @@ import logging
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from collections import defaultdict
+import json
 
 # Import from our new security module and the existing supabase_client
 # The '..' indicates the parent directory where supabase_client.py is located
@@ -68,6 +69,13 @@ async def get_all_orders():
                 if order.get('user') and isinstance(order['user'], list):
                     # This shouldn't happen based on a to-one relationship, but good to be safe
                     order['user'] = order['user'][0] if order['user'] else None
+                # Ensure items_json is a list, not a string
+                if 'items_json' in order and isinstance(order['items_json'], str):
+                    try:
+                        order['items_json'] = json.loads(order['items_json'])
+                    except Exception as e:
+                        logger.error(f"Failed to parse items_json for order {order.get('id')}: {e}")
+                        order['items_json'] = []
             return response.data
         return []
     except Exception as e:
