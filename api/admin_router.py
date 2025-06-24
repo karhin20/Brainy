@@ -203,13 +203,16 @@ async def update_user_status(user_id: str, block_status: UserBlockStatus):
         raise HTTPException(status_code=500, detail="Database connection not available")
 
     try:
-        response = supabase.table("users").update({
+        # 1. Update the user
+        supabase.table("users").update({
             "is_blocked": block_status.is_blocked,
             "updated_at": datetime.now().isoformat()
-        }).eq("id", user_id).select("*").single().execute()
-        
-        if response.data:
-            return response.data
+        }).eq("id", user_id).execute()
+
+        # 2. Fetch the updated user
+        fetch_res = supabase.table("users").select("*").eq("id", user_id).single().execute()
+        if fetch_res.data:
+            return fetch_res.data
         raise HTTPException(status_code=404, detail="User not found")
         
     except Exception as e:
@@ -318,13 +321,15 @@ async def update_order_status(order_id: str, status_update: OrderStatusUpdate):
         raise HTTPException(status_code=500, detail="Database connection not available")
 
     try:
-        # Update the order status in the database
-        update_res = supabase.table("orders").update({
+        # 1. Update the order
+        supabase.table("orders").update({
             "status": status_update.status,
             "updated_at": datetime.now().isoformat()
-        }).eq("id", order_id).select("*, user:users(phone_number)").single().execute()
-        
-        updated_order = update_res.data
+        }).eq("id", order_id).execute()
+
+        # 2. Fetch the updated order with join
+        fetch_res = supabase.table("orders").select("*, user:users(phone_number)").eq("id", order_id).single().execute()
+        updated_order = fetch_res.data
         
         # Notify the customer via WhatsApp
         if updated_order and updated_order.get("user"):
