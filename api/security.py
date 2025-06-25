@@ -57,9 +57,6 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
 
         if response.status_code == 200:
             user = response.json()
-            # You can add role checks here in the future if needed
-            # For example: if user.get('app_metadata', {}).get('role') != 'admin':
-            #   raise HTTPException(status_code=403, detail="Not authorized")
             return user
         else:
             logger.warning(f"JWT verification failed with status {response.status_code}: {response.text}")
@@ -81,8 +78,7 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
             detail="Could not validate credentials",
         )
 
-# MODIFIED: get_admin_user now accepts a supabase client as an argument, type hinted with Any
-async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: Any = Depends(lambda: None)): # Default to None
+async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: Any = None): # Default to None in function signature for flexibility
     """
     Depends on verify_jwt, then checks if the user has admin privileges.
     Admin role is expected to be in the 'app_metadata' of the JWT.
@@ -90,7 +86,6 @@ async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: Any 
     """
     app_metadata = user.get('app_metadata', {})
 
-    # Check for 'admin' in a list of roles or if a single role field is 'admin'
     user_roles = app_metadata.get('roles', [])
     user_role = app_metadata.get('role', '')
 
@@ -104,8 +99,7 @@ async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: Any 
     logger.info(f"Admin access granted for user {user.get('id')}.")
 
     # Fetch admin profile data using the 'id' column, assuming it's the foreign key to auth.users.id
-    # MODIFIED: Use the passed supabase_client instead of the global 'supabase'
-    if supabase_client:
+    if supabase_client: # Keep this check in case None is explicitly passed
         try:
             profile_res = await supabase_client.table("admin_profiles").select("full_name, avatar_url").eq("id", user['id']).limit(1).execute()
             if profile_res.data:

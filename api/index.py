@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 try:
-    from supabase_client import supabase
+    from supabase_client import supabase # This is the main supabase instance
     if supabase:
         logger.info("Supabase client initialized successfully.")
     else:
@@ -41,35 +41,29 @@ except Exception as e:
 
 
 # Import routers and security module
+admin_router, security, auth_router, public_router = None, None, None # Initialize to None
+send_whatsapp_message_available = False # Initialize to False
+send_whatsapp_message_func = None # To hold the function if imported
+
 try:
-    # Correct relative import path for modules within the same package
-    # Assuming index.py is in the package root or directly next to these modules
-    # If index.py is in a subdir like 'api', this needs adjustment
     from . import admin_router, security, auth_router, public_router
     from .utils import send_whatsapp_message
     send_whatsapp_message_available = True
+    send_whatsapp_message_func = send_whatsapp_message # Assign the imported function
 except ImportError as e:
     logger.error(f"Failed to import internal modules (routers, security, utils): {e}", exc_info=True)
-    # Assign None only if the specific import failed
-    # Re-import if necessary to ensure names exist even if None
-    try:
-        from . import admin_router, security, auth_router, public_router
-    except ImportError:
-        admin_router, security, auth_router, public_router = None, None, None, None
+    # If import failed, they remain None. Define a dummy send_whatsapp_message
+    async def send_whatsapp_message_func(to: str, body: str):
+        logger.error(f"send_whatsapp_message utility is not available. Tried to send to {to}: {body}")
+except Exception as ex:
+    logger.error(f"Unexpected error assigning send_whatsapp_message: {ex}", exc_info=True)
+    async def send_whatsapp_message_func(to: str, body: str):
+        logger.error(f"send_whatsapp_message utility is not available. Tried to send to {to}: {body}")
 
-    try:
-        from .utils import send_whatsapp_message as _swm # Import with alias if possible
-        send_whatsapp_message_available = True
-        send_whatsapp_message = _swm # Re-assign the imported function
-    except ImportError:
-         send_whatsapp_message_available = False
-         async def send_whatsapp_message(to: str, body: str):
-             logger.error(f"send_whatsapp_message utility is not available. Tried to send to {to}: {body}")
-    except Exception as ex:
-         logger.error(f"Unexpected error assigning send_whatsapp_message: {ex}", exc_info=True)
-         send_whatsapp_message_available = False
-         async def send_whatsapp_message(to: str, body: str):
-             logger.error(f"send_whatsapp_message utility is not available. Tried to send to {to}: {body}")
+
+# Use send_whatsapp_message_func in place of send_whatsapp_message where needed
+# For clarity later, you might want to rename send_whatsapp_message_func to send_whatsapp_message
+# if the try/except block assigns it cleanly. For now, I'll keep the func name.
 
 
 # --- Configuration Management using Pydantic Settings ---
@@ -163,10 +157,14 @@ async def error_handling_middleware(request: Request, call_next):
 
 
 # --- Include Routers ---
-# Check if security module was imported successfully before using it in dependencies
-if security and admin_router:
-    # MODIFIED: Pass the global 'supabase' client as a dependency to get_admin_user
-    app.include_router(admin_router.router, prefix="/admin", tags=["admin"], dependencies=[Depends(lambda: security.get_admin_user(supabase_client=supabase))]) # Pass supabase explicitly
+if security and admin_router and supabase: # Only include if security and supabase are available
+    # MODIFIED: Pass the global 'supabase' client via a lambda that returns a Depends call
+    app.include_router(
+        admin_router.router,
+        prefix="/admin",
+        tags=["admin"],
+        dependencies=[Depends(security.verify_jwt), Depends(lambda: security.get_admin_user(supabase_client=supabase))]
+    )
 if auth_router:
     app.include_router(auth_router.router, prefix="/auth", tags=["auth"])
 if public_router:
@@ -765,7 +763,7 @@ async def whatsapp_webhook(request: Request):
         if not supabase:
              logger.error(f"Supabase client not available for processing message from {from_number_clean}.")
              if send_whatsapp_message_available:
-                 await send_whatsapp_message(from_number_clean, "Sorry, I'm currently experiencing technical difficulties. Please try again later.")
+                 await send_whatsapp_message_func(from_number_clean, "Sorry, I'm currently experiencing technical difficulties. Please try again later.")
              return JSONResponse(content={"detail": "Database unavailable"}, status_code=status.HTTP_200_OK)
 
 
@@ -810,14 +808,14 @@ async def whatsapp_webhook(request: Request):
                          # Critical failure: User creation failed or fetch failed
                          logger.critical(f"Failed to create AND retrieve new user for {from_number_clean}.")
                          if send_whatsapp_message_available:
-                            await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
+                            await send_whatsapp_message_func(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
                          return JSONResponse(content={}, status_code=status.HTTP_200_OK)
 
 
             except Exception as e:
                  logger.error(f"Failed to create new user for {from_number_clean}: {e}", exc_info=True)
                  if send_whatsapp_message_available:
-                    await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
+                    await send_whatsapp_message_func(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
                  return JSONResponse(content={}, status_code=status.HTTP_200_OK)
 
         user_id = user['id']
@@ -1167,7 +1165,7 @@ async def whatsapp_webhook(request: Request):
         # Only attempt to send if there is a reply message AND the utility is available
         if reply_message and send_whatsapp_message_available:
              try:
-                await send_whatsapp_message(from_number_clean, reply_message)
+                await send_whatsapp_message_func(from_number_clean, reply_message)
                 logger.info(f"Sent reply to {from_number_clean}.")
                 try:
                     # Save the sent message as last_bot_message for 'repeat' intent
@@ -1197,7 +1195,7 @@ async def whatsapp_webhook(request: Request):
         # Attempt to send an emergency error message if possible and no reply was set
         if not reply_message and from_number_clean != "unknown" and send_whatsapp_message_available:
              try:
-                await send_whatsapp_message(from_number_clean, "Oh, something went wrong on my end. Please try again in a moment.")
+                await send_whatsapp_message_func(from_number_clean, "Oh, something went wrong on my end. Please try again in a moment.")
              except Exception as send_e_2:
                  logger.error(f"Failed to send emergency error message to {from_number_clean}: {send_e_2}", exc_info=True)
 
@@ -1325,7 +1323,7 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
         )
         if send_whatsapp_message_available:
             try:
-                await send_whatsapp_message(phone_number, delivery_msg)
+                await send_whatsapp_message_func(phone_number, delivery_msg)
                 logger.info(f"Sent confirmation message to user {user_id} ({phone_number}) for order {order_id}")
                 try:
                     # Save the sent message as last_bot_message
@@ -1572,7 +1570,7 @@ async def payment_success_webhook(request: Request):
                  )
 
                  try:
-                     await send_whatsapp_message(phone_number, notification_message)
+                     await send_whatsapp_message_func(phone_number, notification_message)
                      logger.info(f"Notified user {order['user_id']} ({phone_number}) about order {order_id} payment status '{new_payment_status}'.")
                      try:
                          # Save the notification message
