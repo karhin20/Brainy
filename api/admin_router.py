@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
-from typing import List, Dict
+from typing import List, Dict, Optional
 import logging
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import json
 
@@ -162,10 +162,13 @@ class AdminUser(BaseModel):
     last_active: datetime | None = None
     is_blocked: bool | None = None
 
+# NEW/MODIFIED Pydantic models for analytics data
 class DashboardStats(BaseModel):
     total_revenue: float
-    orders_today: int
+    orders_in_period: int # Renamed from orders_today to be more general
     total_customers: int
+    average_order_value: float # NEW
+    new_customers_in_period: int # NEW
 
 class SalesDataPoint(BaseModel):
     date: str
@@ -175,9 +178,19 @@ class TopProductDataPoint(BaseModel):
     name: str
     count: int
 
+class CategorySalesDataPoint(BaseModel): # NEW
+    category: str
+    revenue: float
+
+class OrderStatusDistributionDataPoint(BaseModel): # NEW
+    status: str
+    count: int
+
 class ChartData(BaseModel):
     sales_over_time: list[SalesDataPoint]
     top_products: list[TopProductDataPoint]
+    revenue_by_category: list[CategorySalesDataPoint] # NEW
+    order_status_distribution: list[OrderStatusDistributionDataPoint] # NEW
 
 class UserBlockStatus(BaseModel):
     is_blocked: bool
@@ -221,96 +234,238 @@ async def update_user_status(user_id: str, block_status: UserBlockStatus):
         raise HTTPException(status_code=500, detail="Failed to update user block status.")
 
 @router.get("/dashboard-charts-data", response_model=ChartData)
-async def get_dashboard_charts_data():
+async def get_dashboard_charts_data(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
     """
-    Get aggregated data for dashboard charts.
+    Get aggregated data for dashboard charts, with optional date range filtering.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Database connection not available")
 
+    # Parse dates or set defaults
+    now_utc = datetime.now(timezone.utc)
+    parsed_start_date: datetime
+    parsed_end_date: datetime
+
+    if start_date:
+        try:
+            parsed_start_date = datetime.fromisoformat(start_date).astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format. Use ISO 8601.")
+    else:
+        # Default to 30 days ago if no start_date is provided
+        parsed_start_date = now_utc - timedelta(days=30)
+    
+    if end_date:
+        try:
+            parsed_end_date = datetime.fromisoformat(end_date).astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format. Use ISO 8601.")
+    else:
+        # Default to now if no end_date is provided
+        parsed_end_date = now_utc
+
+    if parsed_start_date >= parsed_end_date:
+        raise HTTPException(status_code=400, detail="start_date must be before end_date.")
+
+
     try:
-        # --- 1. Sales Over Time (Last 30 days) ---
-        thirty_days_ago = datetime.now() - timedelta(days=30)
+        # --- 1. Sales Over Time ---
+        # Filter paid orders by the specified date range
+        paid_orders_query_base = supabase.table("orders").select("created_at, total_with_delivery, total_amount, items_json, status").eq("payment_status", "paid") # Added items_json, status for new metrics
+        paid_orders_query_base = paid_orders_query_base.gte("created_at", parsed_start_date.isoformat())
+        paid_orders_query_base = paid_orders_query_base.lte("created_at", parsed_end_date.isoformat())
         
-        paid_orders_res = supabase.table("orders").select("created_at, total_with_delivery, total_amount").eq("payment_status", "paid").gte("created_at", thirty_days_ago.isoformat()).execute()
-        
+        all_paid_orders_res_for_charts = paid_orders_query_base.execute() # Fetch once for all chart data
+
         sales_by_day = defaultdict(float)
-        if paid_orders_res.data:
-            for order in paid_orders_res.data:
-                total = order.get('total_with_delivery') or order.get('total_amount') or 0.0
-                day = datetime.fromisoformat(order['created_at'].replace('Z', '+00:00')).strftime('%Y-%m-%d')
-                sales_by_day[day] += total
         
-        sales_over_time = [SalesDataPoint(date=day, sales=round(sales, 2)) for day, sales in sorted(sales_by_day.items())]
-
-        # --- 2. Top Selling Products ---
-        all_paid_orders_res = supabase.table("orders").select("items_json").eq("payment_status", "paid").execute()
+        # --- For Category Sales and Order Status Distribution ---
+        revenue_by_category_raw = defaultdict(float)
+        order_status_counts = defaultdict(int)
         
-        product_counts = defaultdict(int)
-        product_ids = set()
+        all_product_ids_in_orders = set()
 
-        if all_paid_orders_res.data:
-            for order in all_paid_orders_res.data:
+        if all_paid_orders_res_for_charts.data:
+            for order in all_paid_orders_res_for_charts.data:
+                total_order_value = order.get('total_with_delivery') or order.get('total_amount') or 0.0
+                order_date_str = datetime.fromisoformat(order['created_at'].replace('Z', '+00:00')).strftime('%Y-%m-%d')
+                sales_by_day[order_date_str] += total_order_value
+
+                # Collect product IDs for category lookup and calculate category revenue
                 items = order.get("items_json") or []
                 for item in items:
+                    # Handle items_json potentially being a string (legacy data)
                     if isinstance(item, str):
                         try:
                             item = json.loads(item)
-                        except Exception:
-                            continue
-                    if isinstance(item, dict):
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse items_json string for order {order.get('id')}: {item}")
+                            continue # Skip this item if it's not valid JSON
+                    
+                    if isinstance(item, dict): # Ensure it's a dictionary after parsing
                         product_id = item.get("product_id")
                         quantity = item.get("quantity")
                         if product_id and quantity:
-                            product_counts[product_id] += quantity
-                            product_ids.add(product_id)
-        
-        top_products_data = []
-        if product_ids:
-            products_res = supabase.table("products").select("id, name").in_("id", list(product_ids)).execute()
-            product_map = {p['id']: p['name'] for p in products_res.data} if products_res.data else {}
+                            all_product_ids_in_orders.add(product_id)
+                            # Actual category revenue calculation will happen after fetching product categories
 
-            for pid, count in product_counts.items():
+                # Count order statuses
+                status = order.get('status')
+                if status:
+                    order_status_counts[status] += 1
+
+        sales_over_time = [SalesDataPoint(date=day, sales=round(sales, 2)) for day, sales in sorted(sales_by_day.items())]
+
+        # --- 2. Top Selling Products & Revenue by Category ---
+        product_counts = defaultdict(int)
+        
+        # Fetch product details (name, category, price) for all products involved in paid orders
+        product_details_map = {} # Map product_id to {name, category, price}
+        if all_product_ids_in_orders:
+            products_res = supabase.table("products").select("id, name, category, price").in_("id", list(all_product_ids_in_orders)).execute()
+            if products_res.data:
+                for p in products_res.data:
+                    product_details_map[p['id']] = p
+
+            # Now iterate orders again to calculate product counts and category revenue
+            if all_paid_orders_res_for_charts.data:
+                for order in all_paid_orders_res_for_charts.data:
+                    items = order.get("items_json") or []
+                    for item in items:
+                        if isinstance(item, str):
+                            try:
+                                item = json.loads(item)
+                            except json.JSONDecodeError:
+                                continue
+                        
+                        if isinstance(item, dict):
+                            product_id = item.get("product_id")
+                            quantity = item.get("quantity")
+                            
+                            if product_id and quantity and product_id in product_details_map:
+                                # For Top Selling Products
+                                product_counts[product_id] += quantity
+
+                                # For Revenue by Category
+                                product_info = product_details_map[product_id]
+                                category = product_info.get('category')
+                                price = product_info.get('price')
+                                if category and price is not None:
+                                    revenue_by_category_raw[category] += price * quantity
+        
+        # Format Top Selling Products
+        top_products_data = []
+        for pid, count in product_counts.items():
+            if pid in product_details_map:
                 top_products_data.append({
-                    "name": product_map.get(pid, "Unknown Product"),
+                    "name": product_details_map[pid].get('name', "Unknown Product"),
                     "count": count
                 })
         
         top_products = sorted(top_products_data, key=lambda x: x['count'], reverse=True)[:5]
         top_products_formatted = [TopProductDataPoint(name=p['name'], count=p['count']) for p in top_products]
 
-        return ChartData(sales_over_time=sales_over_time, top_products=top_products_formatted)
+        # Format Revenue by Category
+        revenue_by_category_formatted = [
+            CategorySalesDataPoint(category=cat, revenue=round(rev, 2)) 
+            for cat, rev in sorted(revenue_by_category_raw.items(), key=lambda item: item[1], reverse=True)
+        ]
+
+        # Format Order Status Distribution
+        order_status_distribution_formatted = [
+            OrderStatusDistributionDataPoint(status=stat.replace('_', ' ').title(), count=count) # Format status string
+            for stat, count in sorted(order_status_counts.items())
+        ]
+
+        return ChartData(
+            sales_over_time=sales_over_time,
+            top_products=top_products_formatted,
+            revenue_by_category=revenue_by_category_formatted, # NEW
+            order_status_distribution=order_status_distribution_formatted # NEW
+        )
 
     except Exception as e:
         logger.error(f"Could not fetch dashboard chart data: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch chart data.")
 
 @router.get("/dashboard-stats", response_model=DashboardStats)
-async def get_dashboard_stats():
+async def get_dashboard_stats(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
     """
-    Retrieve aggregated statistics for the main dashboard.
+    Retrieve aggregated statistics for the main dashboard, with optional date range filtering.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Database connection not available")
 
+    # Parse dates or set defaults for stats
+    now_utc = datetime.now(timezone.utc)
+    parsed_start_date: datetime
+    parsed_end_date: datetime
+
+    if start_date:
+        try:
+            parsed_start_date = datetime.fromisoformat(start_date).astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format. Use ISO 8601.")
+    else:
+        # Default to 30 days ago if no start_date is provided for stats
+        parsed_start_date = now_utc - timedelta(days=30)
+    
+    if end_date:
+        try:
+            parsed_end_date = datetime.fromisoformat(end_date).astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format. Use ISO 8601.")
+    else:
+        # Default to now if no end_date is provided for stats
+        parsed_end_date = now_utc
+
+    if parsed_start_date >= parsed_end_date:
+        raise HTTPException(status_code=400, detail="start_date must be before end_date.")
+
     try:
-        # 1. Calculate Total Revenue from paid orders
-        paid_orders_res = supabase.table("orders").select("total_with_delivery").eq("payment_status", "paid").execute()
+        # 1. Calculate Total Revenue from paid orders within the date range
+        paid_orders_query = supabase.table("orders").select("total_with_delivery").eq("payment_status", "paid")
+        paid_orders_query = paid_orders_query.gte("created_at", parsed_start_date.isoformat())
+        paid_orders_query = paid_orders_query.lte("created_at", parsed_end_date.isoformat())
+        
+        paid_orders_res = paid_orders_query.execute()
+        
         total_revenue = sum(order['total_with_delivery'] for order in paid_orders_res.data if order['total_with_delivery'] is not None)
+        
+        # 2. Get Orders in selected period
+        orders_in_period_query = supabase.table("orders").select("id", count="exact")
+        orders_in_period_query = orders_in_period_query.gte("created_at", parsed_start_date.isoformat())
+        orders_in_period_query = orders_in_period_query.lte("created_at", parsed_end_date.isoformat())
+        orders_in_period_res = orders_in_period_query.execute()
+        orders_in_period = orders_in_period_res.count
 
-        # 2. Get Orders Today
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        orders_today_res = supabase.table("orders").select("id", count="exact").gte("created_at", today_start.isoformat()).execute()
-        orders_today = orders_today_res.count
+        # Calculate Average Order Value (NEW KPI)
+        average_order_value = total_revenue / orders_in_period if orders_in_period > 0 else 0.0
 
-        # 3. Get Total Customers
+        # 3. Get Total Customers (overall, not date filtered)
         customers_res = supabase.table("users").select("id", count="exact").execute()
         total_customers = customers_res.count
+        
+        # 4. Get New Customers in selected period (NEW KPI)
+        new_customers_query = supabase.table("users").select("id", count="exact")
+        new_customers_query = new_customers_query.gte("created_at", parsed_start_date.isoformat())
+        new_customers_query = new_customers_query.lte("created_at", parsed_end_date.isoformat())
+        new_customers_res = new_customers_query.execute()
+        new_customers_in_period = new_customers_res.count
+
 
         return {
             "total_revenue": total_revenue,
-            "orders_today": orders_today,
-            "total_customers": total_customers
+            "orders_in_period": orders_in_period, # Renamed from orders_today
+            "total_customers": total_customers,
+            "average_order_value": round(average_order_value, 2), # NEW
+            "new_customers_in_period": new_customers_in_period # NEW
         }
     except Exception as e:
         logger.error(f"Could not fetch dashboard stats: {e}", exc_info=True)
