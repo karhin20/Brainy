@@ -165,7 +165,8 @@ async def error_handling_middleware(request: Request, call_next):
 # --- Include Routers ---
 # Check if security module was imported successfully before using it in dependencies
 if security and admin_router:
-    app.include_router(admin_router.router, prefix="/admin", tags=["admin"], dependencies=[Depends(security.get_admin_user)]) # Assuming admin routes need admin auth
+    # MODIFIED: Pass the global 'supabase' client as a dependency to get_admin_user
+    app.include_router(admin_router.router, prefix="/admin", tags=["admin"], dependencies=[Depends(lambda: security.get_admin_user(supabase_client=supabase))]) # Pass supabase explicitly
 if auth_router:
     app.include_router(auth_router.router, prefix="/auth", tags=["auth"])
 if public_router:
