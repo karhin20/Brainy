@@ -107,10 +107,10 @@ async def get_admin_user(user: dict = Depends(verify_jwt)):
     
     logger.info(f"Admin access granted for user {user.get('id')}.")
 
-    # Fetch admin profile data
+    # Fetch admin profile data using the 'id' column, assuming it's the foreign key to auth.users.id
     if supabase:
         try:
-            profile_res = await supabase.table("admin_profiles").select("full_name, avatar_url").eq("user_id", user['id']).limit(1).execute()
+            profile_res = await supabase.table("admin_profiles").select("full_name, avatar_url").eq("id", user['id']).limit(1).execute()
             if profile_res.data:
                 user["admin_profile"] = profile_res.data[0]
                 logger.info(f"Attached admin profile for user {user['id']}.")
