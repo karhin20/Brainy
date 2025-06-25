@@ -4,9 +4,7 @@ from os import getenv
 import logging
 import os
 import httpx
-
-# NEW: Import SupabaseClient type only, so we can type hint the dependency
-from supabase_client import SupabaseClient
+from typing import Any
 
 API_KEY = getenv("API_KEY")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -83,8 +81,8 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
             detail="Could not validate credentials",
         )
 
-# MODIFIED: get_admin_user now accepts a supabase client as an argument
-async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: SupabaseClient = Depends(lambda: None)): # Default to None
+# MODIFIED: get_admin_user now accepts a supabase client as an argument, type hinted with Any
+async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: Any = Depends(lambda: None)): # Default to None
     """
     Depends on verify_jwt, then checks if the user has admin privileges.
     Admin role is expected to be in the 'app_metadata' of the JWT.
