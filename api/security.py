@@ -4,7 +4,12 @@ from os import getenv
 import logging
 import os
 import httpx
-from typing import Any
+
+try:
+    from supabase_client import supabase, SupabaseClient
+except ImportError:
+    supabase = None
+    SupabaseClient = None
 
 API_KEY = getenv("API_KEY")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -35,16 +40,16 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
     if not token:
         logger.warning("JWT verification failed: Token is missing.")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_401_UNAUTHORIZED, 
             detail="Not authenticated"
         )
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         logger.error("JWT verification failed: Supabase URL or Key not configured on the server.")
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
             detail="Authentication service is misconfigured"
         )
-
+        
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -54,9 +59,12 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
                     "Authorization": f"Bearer {token}"
                 }
             )
-
+        
         if response.status_code == 200:
             user = response.json()
+            # You can add role checks here in the future if needed
+            # For example: if user.get('app_metadata', {}).get('role') != 'admin':
+            #   raise HTTPException(status_code=403, detail="Not authorized")
             return user
         else:
             logger.warning(f"JWT verification failed with status {response.status_code}: {response.text}")
@@ -64,7 +72,7 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token or expired session."
             )
-
+            
     except httpx.RequestError as e:
         logger.error(f"JWT verification failed due to a network error: {e}", exc_info=True)
         raise HTTPException(
@@ -76,16 +84,17 @@ async def verify_jwt(token: str = Depends(oauth2_scheme)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
-        )
+        ) 
 
-async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: Any = None): # Default to None in function signature for flexibility
+async def get_admin_user(user: dict = Depends(verify_jwt)):
     """
     Depends on verify_jwt, then checks if the user has admin privileges.
     Admin role is expected to be in the 'app_metadata' of the JWT.
     Additionally fetches admin_profile information if available.
     """
     app_metadata = user.get('app_metadata', {})
-
+    
+    # Check for 'admin' in a list of roles or if a single role field is 'admin'
     user_roles = app_metadata.get('roles', [])
     user_role = app_metadata.get('role', '')
 
@@ -95,13 +104,13 @@ async def get_admin_user(user: dict = Depends(verify_jwt), supabase_client: Any 
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to access this resource."
         )
-
+    
     logger.info(f"Admin access granted for user {user.get('id')}.")
 
     # Fetch admin profile data using the 'id' column, assuming it's the foreign key to auth.users.id
-    if supabase_client: # Keep this check in case None is explicitly passed
+    if supabase:
         try:
-            profile_res = await supabase_client.table("admin_profiles").select("full_name, avatar_url").eq("id", user['id']).limit(1).execute()
+            profile_res = await supabase.table("admin_profiles").select("full_name, avatar_url").eq("id", user['id']).limit(1).execute()
             if profile_res.data:
                 user["admin_profile"] = profile_res.data[0]
                 logger.info(f"Attached admin profile for user {user['id']}.")
