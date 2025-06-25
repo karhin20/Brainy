@@ -420,12 +420,12 @@ async def change_password(request: PasswordChangeRequest, current_user: dict = D
             raise HTTPException(status_code=400, detail="Invalid current password.")
         raise HTTPException(status_code=500, detail="An unexpected error occurred while changing password.")
 
-# Pydantic model for Admin profile response (can reuse AdminUser if it fits or create a new one)
+# Pydantic model for Admin profile response
 class AdminProfileResponse(BaseModel):
     id: str
-    phone_number: str
-    email: str | None = None # Supabase user might have email
-    admin_profile: Dict[str, str] | None = None # This will contain full_name and avatar_url
+    phone_number: str | None = None  # Make phone_number optional
+    email: str | None = None
+    admin_profile: Dict[str, str] | None = None
 
 @router.get("/me", response_model=AdminProfileResponse)
 async def get_current_admin_user(current_user: dict = Depends(security.get_admin_user)):
