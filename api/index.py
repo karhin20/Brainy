@@ -340,30 +340,42 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
              # --- Fallback logic - simple keyword matching with basic typo tolerance ---
              lower_msg = message.lower().strip()
              
+             # Keywords for each intent
+             buy_keywords = ["buy", "want", "order", "menu", "available", "shop", "groceries", "fresh items", "what do you have", "start order", "place order", "get food"]
+             status_keywords = ["status", "track", "where is my", "check my order", "order update", "delivery status", "how far with my order"]
+             cancel_keywords = ["cancel", "undo order", "stop order"]
+             greet_keywords = ["hello", "hi", "hey", "hola", "morning", "afternoon", "good morning", "good afternoon", "good evening", "greetings"]
+             help_keywords = ["help", "how", "instructions", "guide", "support", "assist", "what can you do"]
+             repeat_keywords = ["repeat", "say again", "last message", "can you repeat", "what was that"]
+             thank_you_keywords = ["thank", "thanks", "thank you", "cheers", "appreciate it"]
+             affirmative_keywords = ["ok", "okay", "k", "ok.", "yes", "yeah", "alright", "got it", "sounds good", "sure", "confirm"]
+             negative_keywords = ["no", "nope", "no thanks", "no.", "that's all", "i'm good", "nothing else", "not really"]
+             modify_keywords = ["add", "change", "modify", "forgot", "remove item", "update order"]
+
              # Multi-intent check
-             buy_present = any(word in lower_msg for word in ["buy", "want", "order", "menu"])
-             status_present = any(word in lower_msg for word in ["status", "track", "where is my"])
+             buy_present = any(word in lower_msg for word in buy_keywords)
+             status_present = any(word in lower_msg for word in status_keywords)
              if buy_present and status_present:
                  return {"intent": "multi_intent", "response": "I can help with one thing at a time. Please ask about your order status or placing a new order separately."}
              
-             if any(word in lower_msg for word in ["add", "change", "modify", "forgot"]):
+             if any(word in lower_msg for word in modify_keywords):
                 return {"intent": "modify_order", "response": "No problem, I can help with that."}
 
-             if "cancel" in lower_msg: return {"intent": "cancel_order", "response": "Okay, I can help with cancelling an order."}
-             if "status" in lower_msg or "track" in lower_msg or "where is my order" in lower_msg: return {"intent": "check_status", "response": "Let me check on your order."}
-             if any(word in lower_msg for word in ["buy", "want", "order", "menu", "available", "shop"]):
+             if any(word in lower_msg for word in cancel_keywords): return {"intent": "cancel_order", "response": "Okay, I can help with cancelling an order."}
+             if any(word in lower_msg for word in status_keywords): return {"intent": "check_status", "response": "Let me check on your order."}
+             if any(word in lower_msg for word in buy_keywords):
                   return {"intent": "buy", "response": "Great! I can help with that."}
-             if any(word in lower_msg for word in ["hello", "hi", "hey", "hola", "morning", "afternoon"]):
+             if any(word in lower_msg for word in greet_keywords):
                   return {"intent": "greet", "response": "Hello! How can I help you today?"}
-             if "help" in lower_msg or "how" in lower_msg:
+             if any(word in lower_msg for word in help_keywords):
                   return {"intent": "help", "response": "I can certainly help with that."}
-             if any(word in lower_msg for word in ["repeat", "say again", "last message"]):
+             if any(word in lower_msg for word in repeat_keywords):
                   return {"intent": "repeat", "response": "Certainly, I can repeat that."}
-             if any(word in lower_msg for word in ["thank", "thanks"]):
+             if any(word in lower_msg for word in thank_you_keywords):
                   return {"intent": "thank_you", "response": "You're welcome!"}
-             if lower_msg in ["ok", "okay", "k", "ok."]:
+             if any(word in lower_msg for word in affirmative_keywords): # Using the expanded list
                  return {"intent": "affirmative_acknowledgement", "response": "Great! Is there anything else I can help you with?"}
-             if lower_msg in ["no", "nope", "no thanks", "no."]:
+             if any(word in lower_msg for word in negative_keywords): # Using the expanded list
                  return {"intent": "negative_acknowledgement", "response": "Alright, have a great day! Feel free to message me anytime you need groceries."}
              return {"intent": "unknown", "response": "I'm sorry, I can only assist with grocery orders. Could you please rephrase?"}
          else:
@@ -520,7 +532,6 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
             insert_res = supabase.table("sessions").insert({
                 "user_id": user_id,
                 "phone_number": from_number,
-                "session_token": session_token,
                 "last_intent": "buy", # Store intent for session context if needed later
                 "created_at": now_utc.isoformat(),
                 # Sessions expire after 24 hours
@@ -648,7 +659,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     elif intent == "modify_order":
         # This case is primarily handled inside the pending_order logic.
         # This is a fallback if it's detected in a new conversation.
-        reply_message = f"{ai_ack} It looks like you don't have an active order to modify. Would you like to start a new one?"
+        reply_message = f"{ai_response_ack} It looks like you don't have an active order to modify. Would you like to start a new one?"
 
     else: # unknown or any other unhandled intent by Gemini/fallback
         logger.info(f"User {user_id} sent message with unknown intent '{intent}'. Message: '{original_message}')")
@@ -1123,10 +1134,9 @@ async def whatsapp_webhook(request: Request):
                         reminder_message = ""
                         if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
                              reminder_message = "\n\nBut please first choose '1' for Delivery or '2' for Pickup for your pending order."
-                    # ... existing code ...
-
-                # else: # This else block was misplaced and caused issues. Removed.
-                #    reply_message = f"I'm not sure how to help with that right now. You currently have a pending order (ID: {order_id}) in progress. Please complete the next step for that order, or reply 'cancel'."
+                        # The original code's "else" block that sets a generic "I'm not sure how to help" was causing issues.
+                        # Instead, we will now use the AI's determined response here.
+                        reply_message = ai_ack + reminder_message if reminder_message else ai_ack
 
 
             # --- Handle incoming Text Message when NO active pending order exists ---
