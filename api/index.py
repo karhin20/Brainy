@@ -29,15 +29,15 @@ logger = logging.getLogger(__name__)
 try:
     from supabase_client import supabase
     if supabase:
-        logger.info("Supabase client initialized successfully.")
+        logger.info("Supabase client initialized successfully (from supabase_client.py import).")
     else:
-         logger.warning("Supabase client did not initialize correctly.")
+         logger.warning("Supabase client did not initialize correctly (from supabase_client.py import is None).")
 except ImportError:
     supabase = None
-    logger.error("Supabase client not found or failed to import. Database operations will be unavailable.")
+    logger.error("Supabase client not found or failed to import (from supabase_client.py). Database operations will be unavailable.")
 except Exception as e:
     supabase = None
-    logger.error(f"Unexpected error importing Supabase client: {e}", exc_info=True)
+    logger.error(f"Unexpected error importing Supabase client (from supabase_client.py): {e}", exc_info=True)
 
 
 # Import routers and security module
@@ -762,10 +762,12 @@ async def whatsapp_webhook(request: Request):
 
         # --- Ensure Supabase is available ---
         if not supabase:
-             logger.error(f"Supabase client not available for processing message from {from_number_clean}.")
+             logger.error(f"SUPABASE CHECK (WHATSAPP_WEBHOOK): Supabase client NOT available. Cannot process message from {from_number_clean}.")
              if send_whatsapp_message_available:
                  await send_whatsapp_message(from_number_clean, "Sorry, I'm currently experiencing technical difficulties. Please try again later.")
              return JSONResponse(content={"detail": "Database unavailable"}, status_code=status.HTTP_200_OK)
+        else:
+            logger.info(f"SUPABASE CHECK (WHATSAPP_WEBHOOK): Supabase client IS available. Proceeding with message from {from_number_clean}.")
 
 
         # Determine if it's a location message
@@ -1219,8 +1221,10 @@ async def confirm_items(request: OrderRequest, api_key: str = Depends(security.v
     """
     # Ensure Supabase and security are available
     if not supabase:
-        logger.error("/confirm-items called but Supabase client is not available.")
+        logger.error("SUPABASE CHECK (CONFIRM_ITEMS): Supabase client NOT available. Cannot process confirm-items.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database connection not available")
+    else:
+        logger.info("SUPABASE CHECK (CONFIRM_ITEMS): Supabase client IS available. Proceeding with confirm-items.")
     if not security:
          logger.error("/confirm-items called but security module is not available.")
          raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Security module not available")
