@@ -871,10 +871,13 @@ async def whatsapp_webhook(request: Request):
                     # Save the received location regardless of whether it's new or confirming saved
                     location_to_save = json.dumps({"latitude": str(latitude), "longitude": str(longitude)})
                     supabase.table("users").update({"last_known_location": location_to_save}).eq("id", user_id).execute()
-                    logger.info(f"Saved location {latitude},{longitude} for user {user_id}")
+                    logger.info(f"Saved user's last known location: Lat={latitude}, Lon={longitude}")
 
                     delivery_fee = calculate_delivery_fee(latitude, longitude)
                     total_with_delivery = active_pending_order['total_amount'] + delivery_fee
+
+                    # ADD THIS LOG HERE:
+                    logger.info(f"DEBUG: Preparing to update order {order_id} with delivery_location_lat={latitude} and delivery_location_lon={longitude}")
 
                     update_data = {
                         "status": DefaultStatus.ORDER_PENDING_PAYMENT, # Move to payment stage
