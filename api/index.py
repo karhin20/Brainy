@@ -522,8 +522,10 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
              logger.error(f"Supabase client not available for 'buy' intent session creation for user {user_id}.")
              return "Sorry, I'm currently having technical difficulties and cannot start a new order. Please try again later."
 
-        session_token = str(uuid.uuid4())
-        selection_url = f"{settings.FRONTEND_URL}?session={session_token}"
+        session_uuid_obj = uuid.uuid4()
+        session_token_str = str(session_uuid_obj) # This is the string we want to insert
+
+        selection_url = f"{settings.FRONTEND_URL}?session={session_token_str}"
         try:
             # Add a check for existing active sessions for this user/phone if needed,
             # though current logic relies on the /confirm-items cleanup.
@@ -532,16 +534,17 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
             insert_res = supabase.table("sessions").insert({
                 "user_id": user_id,
                 "phone_number": from_number,
-                "last_intent": "buy", # Store intent for session context if needed later
+                "session_token": session_token_str, # Explicitly pass the string for a VARCHAR column
+                "last_intent": "buy",
                 "created_at": now_utc.isoformat(),
                 # Sessions expire after 24 hours
                 "expires_at": (now_utc + timedelta(hours=24)).isoformat()
             }).execute()
             # Check result for success if the supabase client version supports it returning data/status
             if not insert_res.data:
-                logger.warning(f"Supabase session insert executed but returned no data for user {user_id}, token {session_token}.")
+                logger.warning(f"Supabase session insert executed but returned no data for user {user_id}, token {session_token_str}.")
 
-            logger.info(f"Created new session {session_token} for user {user_id}")
+            logger.info(f"Created new session {session_token_str} for user {user_id}")
 
             # Combine AI acknowledgement with menu link message
             greeting_part = "Welcome! " if is_new_user else ""
@@ -1111,13 +1114,14 @@ async def whatsapp_webhook(request: Request):
                             }).eq("id", order_id).execute()
 
                             # 2. Create a new session and link, like in 'buy' intent
-                            session_token = str(uuid.uuid4())
-                            selection_url = f"{settings.FRONTEND_URL}?session={session_token}"
+                            session_uuid_obj = uuid.uuid4()
+                            session_token_str = str(session_uuid_obj) # This is the string we want to insert
+                            selection_url = f"{settings.FRONTEND_URL}?session={session_token_str}"
                             now_utc = datetime.now(timezone.utc)
                             supabase.table("sessions").insert({
                                 "user_id": user_id,
                                 "phone_number": from_number_clean,
-                                "session_token": session_token,
+                                "session_token": session_token_str, # Explicitly pass the string for a VARCHAR column
                                 "created_at": now_utc.isoformat(),
                                 "expires_at": (now_utc + timedelta(hours=24)).isoformat()
                             }).execute()
