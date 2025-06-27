@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Dict, Optional
 import logging
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import json
@@ -50,6 +50,24 @@ class AdminOrder(BaseModel):
     delivery_location_lat: float | None = None
     delivery_location_lon: float | None = None
 
+# NEW: Pydantic model for a single conversation entry
+class ConversationEntry(BaseModel):
+    speaker: str
+    message: str
+    timestamp: datetime
+    type: str | None = None # Optional: "text", "location", "media"
+    intent: str | None = None # Optional: if bot message includes intent
+
+# NEW: Pydantic model for Session data
+class AdminSession(BaseModel):
+    id: str
+    user_id: str
+    phone_number: str
+    session_token: str
+    last_intent: str | None = None
+    created_at: datetime
+    expires_at: datetime
+    conversation_history: List[ConversationEntry] | None = None # Make it optional and list of entries
 
 @router.get("/orders", response_model=List[AdminOrder])
 async def get_all_orders():
@@ -85,6 +103,34 @@ async def get_all_orders():
         logger.error(f"Could not fetch orders for admin: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch orders.")
 
+# NEW: Endpoint to get all sessions
+@router.get("/sessions", response_model=List[AdminSession])
+async def get_all_sessions():
+    """
+    Retrieve all sessions from the database for the admin dashboard, including conversation history.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    try:
+        response = supabase.table("sessions").select("*").order("created_at", desc=True).execute()
+
+        # Manually parse conversation_history if it comes as a string (jsonb as text)
+        if response.data:
+            for session in response.data:
+                if 'conversation_history' in session and isinstance(session['conversation_history'], str):
+                    try:
+                        session['conversation_history'] = json.loads(session['conversation_history'])
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to parse conversation_history JSON for session {session.get('id')}. Setting to empty list.")
+                        session['conversation_history'] = []
+                elif 'conversation_history' not in session or session['conversation_history'] is None:
+                    session['conversation_history'] = [] # Ensure it's an empty list if null/missing
+            return response.data
+        return []
+    except Exception as e:
+        logger.error(f"Could not fetch sessions for admin: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch sessions.")
 
 # Pydantic model for Product data
 class Product(BaseModel):
