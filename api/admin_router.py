@@ -47,6 +47,8 @@ class AdminOrder(BaseModel):
     items_json: List[AdminOrderItem]
     user: UserInfo | None = None
     order_number: str | None = None
+    delivery_location_lat: float | None = None
+    delivery_location_lon: float | None = None
 
 
 @router.get("/orders", response_model=List[AdminOrder])
@@ -61,7 +63,7 @@ async def get_all_orders():
     try:
         # Foreign table joins in Supabase are done with `select=...`
         # The query gets all orders and for each order, gets the phone_number from the related 'users' table
-        response = supabase.table("orders").select("*, user:users(phone_number)").order("created_at", desc=True).execute()
+        response = supabase.table("orders").select("*, user:users(phone_number), delivery_location_lat, delivery_location_lon").order("created_at", desc=True).execute()
 
         if response.data:
             # The 'user' field in the response is an object, not a list
