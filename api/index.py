@@ -369,23 +369,28 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
                  return {"intent": "affirmative_acknowledgement", "response": "Great! Is there anything else I can help you with?"}
              if any(word in lower_msg for word in negative_keywords): # Using the expanded list
                  return {"intent": "negative_acknowledgement", "response": "Alright, have a great day! Feel free to message me anytime you need groceries."}
-             return {"intent": "unknown", "response": "I'm sorry, I can only assist with grocery orders. Could you please rephrase?"}
+             # Modified: Direct to human support for unknown intent in fallback
+             return {"intent": "unknown", "response": "I'm sorry, I couldn't understand your request. Please call our support team at *+233543119117* for direct assistance."}
          else:
              # Handle other ValueErrors from call_gemini_api (e.g. empty text payload)
              logger.error(f"Error processing Gemini response: {e}", exc_info=True)
-             return {"intent": "unknown", "response": f"There was an issue processing the response from my service. Please try again."} # Removed detailed error for user
+             # Modified: Direct to human support for processing issues
+             return {"intent": "unknown", "response": "There was an issue processing your request. Please call our support team at *+233543119117* for direct assistance."}
 
 
     except httpx.RequestError as e:
         logger.error(f"Gemini API communication error: {e}", exc_info=True)
-        return {"intent": "unknown", "response": "I'm having trouble connecting to my service. Please try again in a moment."}
+        # Modified: Direct to human support for API connection issues
+        return {"intent": "unknown", "response": "I'm having trouble connecting to my service. Please call our support team at *+233543119117* for direct assistance."}
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding Gemini response JSON: {e}", exc_info=True)
-        return {"intent": "unknown", "response": "I received an unreadable response from my processing service. Please try again."}
+        # Modified: Direct to human support for unreadable responses
+        return {"intent": "unknown", "response": "I received an unreadable response from my processing service. Please call our support team at *+233543119117* for direct assistance."}
     except Exception as e:
         # Catch any other unexpected errors during the process
         logger.error(f"Unexpected error during Gemini intent extraction: {e}", exc_info=True)
-        return {"intent": "unknown", "response": "I'm sorry, something unexpected went wrong with my processing. Please try again."}
+        # Modified: Direct to human support for unexpected errors
+        return {"intent": "unknown", "response": "I'm sorry, something unexpected went wrong. Please call our support team at *+233543119117* for direct assistance."}
 
 
 async def generate_paystack_payment_link(order_id: str, amount: float, user_phone: str) -> str:
@@ -506,6 +511,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
     ai_response_ack = intent_data.get("response", "Okay.") # Default fallback ack
 
     reply_message = "" # Initialize reply message here
+    lower_original_message = original_message.lower().strip() # Convert to lowercase here for checks
 
     if intent == "buy":
         # Ensure supabase is available for database operations
@@ -655,7 +661,12 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
          reply_message = ai_response_ack
 
     elif intent == "affirmative_acknowledgement":
-        reply_message = ai_response_ack
+        if lower_original_message == "paid":
+            # Specific response for 'paid' message
+            reply_message = "Thank you! We will update you with changes if there is any."
+        else:
+            # Generic response for other affirmative acknowledgements
+            reply_message = ai_response_ack
 
     elif intent == "negative_acknowledgement":
         reply_message = ai_response_ack
@@ -1175,6 +1186,7 @@ async def whatsapp_webhook(request: Request):
                 # Call handle_new_conversation to get the appropriate response based on intent
                 # Pass current_conversation_history which only contains the user's message at this point
                 reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg, current_conversation_history)
+                                                                                                        # ^ Pass original_message here
 
 
         # D. Handle empty or unhandled message type (if no text, location, or media was processed)
@@ -1504,7 +1516,7 @@ async def payment_success_webhook(request: Request):
                      new_order_status = DefaultStatus.ORDER_FAILED
                      update_needed = True
                      notification_prefix = "❌ Payment Failed"
-                     notification_suffix = " There was an issue processing your payment. Please try again or contact support if the amount was deducted."
+                     notification_suffix = " There was an issue processing your payment. Please try again or contact support on +233543119117 if the amount was deducted."
                  else:
                       notification_needed = False
 
