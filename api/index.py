@@ -1127,7 +1127,7 @@ async def whatsapp_webhook(request: Request):
                     intent = gemini_result.get('intent')
                     ai_ack = gemini_result.get('response', 'Okay.')
 
-                    if intent == 'modify_order':
+                    if intent == 'modify_order' or intent == 'buy': # <-- ADDED 'or intent == 'buy''
                         handled_by_pending_state = True
                         try:
                             # 1. Cancel the current pending order
@@ -1135,8 +1135,15 @@ async def whatsapp_webhook(request: Request):
                                 "status": DefaultStatus.ORDER_CANCELLED,
                                 "payment_status": DefaultStatus.PAYMENT_CANCELLED,
                                 "updated_at": datetime.now(timezone.utc).isoformat(),
-                                "cancellation_reason": "user modified selection"
+                                "cancellation_reason": "user modified selection" if intent == 'modify_order' else "user started new order" # <-- UPDATED REASON
                             }).eq("id", order_id).execute()
+
+                            # If 'buy' intent, effectively reset pending order state to create new session
+                            if intent == 'buy':
+                                active_pending_order = None # This will force the flow into the else block below
+                                handled_by_pending_state = False # This ensures handle_new_conversation is called
+                                logger.debug(f"DEBUG: Active pending order {order_id} cancelled due to 'buy' intent. Proceeding to create new session.")
+                                # We'll re-call handle_new_conversation outside this block
 
                             # 2. Create a new session and link, like in 'buy' intent
                             session_uuid_obj = uuid.uuid4()
