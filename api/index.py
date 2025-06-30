@@ -512,8 +512,10 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
     reply_message = "" # Initialize reply message here
     lower_original_message = original_message.lower().strip() # Convert to lowercase here for checks
+    logger.debug(f"DEBUG: handle_new_conversation called with intent: {intent}")
 
     if intent == "buy":
+        logger.debug(f"DEBUG: Entering 'buy' intent block for user {user_id}.")
         # Ensure supabase is available for database operations
         if not supabase:
              logger.error(f"Supabase client not available for 'buy' intent session creation for user {user_id}.")
@@ -521,6 +523,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
 
         session_uuid_obj = uuid.uuid4()
         session_token_str = str(session_uuid_obj) # This is the string we want to insert
+        logger.debug(f"DEBUG: Generated session token: {session_token_str}")
 
         selection_url = f"{settings.FRONTEND_URL}?session={session_token_str}"
         try:
@@ -555,6 +558,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
                 "expires_at": (now_utc + timedelta(hours=24)).isoformat(),
                 "conversation_history": json.dumps(new_session_history) # Store the history as JSON string
             }).execute()
+            logger.debug(f"DEBUG: Supabase session insert result data: {insert_res.data}. Supabase session insert result error: {insert_res.error}")
             # Check result for success if the supabase client version supports it returning data/status
             if not insert_res.data:
                 logger.warning(f"Supabase session insert executed but returned no data for user {user_id}, token {session_token_str}.")
@@ -873,6 +877,7 @@ async def whatsapp_webhook(request: Request):
         # Find the most recent pending order
         latest_pending_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("payment_status", DefaultStatus.PAYMENT_UNPAID).not_.in_("status", [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]).order("created_at", desc=True).limit(1).execute()
         active_pending_order = latest_pending_res.data[0] if latest_pending_res.data else None
+        logger.debug(f"DEBUG: Active pending order found: {active_pending_order is not None}")
 
         # If a recent pending order exists, find and cancel any older ones
         if active_pending_order:
@@ -1118,6 +1123,7 @@ async def whatsapp_webhook(request: Request):
                 if not handled_by_pending_state:
                     user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))} # Context might be useful for Gemini
                     gemini_result = await get_intent_gracefully(incoming_msg, user_context)
+                    logger.debug(f"DEBUG: Gemini intent for active pending order path: {gemini_result.get('intent')}")
                     intent = gemini_result.get('intent')
                     ai_ack = gemini_result.get('response', 'Okay.')
 
@@ -1180,12 +1186,15 @@ async def whatsapp_webhook(request: Request):
 
             # --- Handle incoming Text Message when NO active pending order exists ---
             else: # No active pending order
+                logger.debug(f"DEBUG: No active pending order. Calling handle_new_conversation.")
                 # Determine intent for a new conversation
                 user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))} # Provide relevant user context
                 gemini_result = await get_intent_gracefully(incoming_msg, user_context)
+                logger.debug(f"DEBUG: Gemini intent for new conversation path: {gemini_result.get('intent')}")
                 # Call handle_new_conversation to get the appropriate response based on intent
                 # Pass current_conversation_history which only contains the user's message at this point
                 reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg, current_conversation_history)
+                logger.debug(f"DEBUG: Reply message from handle_new_conversation: {reply_message[:50]}...") # Log truncated reply
                                                                                                         # ^ Pass original_message here
 
 
