@@ -343,7 +343,7 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
              affirmative_keywords = ["ok", "okay", "k", "ok.", "yes", "yeah", "alright", "got it", "sounds good", "sure", "confirm"]
              negative_keywords = ["no", "nope", "no thanks", "no.", "that's all", "i'm good", "nothing else", "not really"]
              modify_keywords = ["add", "change", "modify", "forgot", "remove item", "update order"]
-             
+
              # Multi-intent check
              buy_present = any(word in lower_msg for word in buy_keywords)
              status_present = any(word in lower_msg for word in status_keywords)
@@ -526,16 +526,13 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
         try:
             now_utc = datetime.now(timezone.utc)
             
-            # Construct the full message explicitly
+            # Get the bot's response that will be part of the new session's history
             greeting_part = "Welcome! " if is_new_user else ""
             bot_reply_for_session = (
-                f"{ai_response_ack} {greeting_part}"
-                "You can select the fresh items you'd like to purchase from our online menu here:\n"
+                f"{ai_response_ack} {greeting_part}" # E.g., "Okay, let's start your order. Welcome! "
+                f"You can select the fresh items you'd like to purchase from our online menu here:\n"
                 f"{selection_url}"
             )
-            
-            # Temporary debug log to check the full message string
-            logger.info(f"DEBUG_BUY_INTENT: Constructed bot_reply_for_session: '{bot_reply_for_session}'")
 
             # Create the initial history for the *new* session
             # This history already includes the user's message (added in whatsapp_webhook)
@@ -543,7 +540,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
             new_session_history = current_conversation_history[:] # Copy the history passed from webhook
             new_session_history.append({
                 "speaker": "bot",
-                "message": bot_reply_for_session, # This is the full message including the URL
+                "message": bot_reply_for_session,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "intent": intent # You might want to store the intent that led to this reply
             })
@@ -669,7 +666,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
             reply_message = "Thank you! We will update you with changes if there is any."
         else:
             # Generic response for other affirmative acknowledgements
-        reply_message = ai_response_ack
+            reply_message = ai_response_ack
 
     elif intent == "negative_acknowledgement":
         reply_message = ai_response_ack
@@ -798,9 +795,9 @@ async def whatsapp_webhook(request: Request):
                     user_id = user['id'] # Set user_id here
                 else:
                      logger.critical(f"Failed to create new user for {from_number_clean}.")
-                         if send_whatsapp_message_available:
-                            await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
-                         return JSONResponse(content={}, status_code=status.HTTP_200_OK)
+                     if send_whatsapp_message_available:
+                        await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
+                     return JSONResponse(content={}, status_code=status.HTTP_200_OK)
 
             except Exception as e:
                  logger.error(f"Failed to create new user for {from_number_clean}: {e}", exc_info=True)
@@ -808,7 +805,7 @@ async def whatsapp_webhook(request: Request):
                     await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
                  return JSONResponse(content={}, status_code=status.HTTP_200_OK)
         else:
-        user_id = user['id']
+            user_id = user['id']
             # Find the active session and load its history
             if user.get('sessions'):
                 # Assuming sessions list is already sorted by created_at desc due to the select query
@@ -1208,10 +1205,9 @@ async def whatsapp_webhook(request: Request):
         # Only attempt to send if there is a reply message AND the utility is available
         if reply_message and send_whatsapp_message_available:
              try:
-                logger.info(f"DEBUG: Attempting to send message to {from_number_clean}. Content: '{reply_message}'") # NEW DEBUG LOG
                 await send_whatsapp_message(from_number_clean, reply_message)
                 truncated_message = reply_message[:1000]
-                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
+                supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
 
                 # Add BOT message to conversation history for existing session or if not already added by handle_new_conversation
                 # Check if the last entry is *not* a bot message with the current reply_message
@@ -1241,7 +1237,7 @@ async def whatsapp_webhook(request: Request):
                         supabase.table("sessions").update({
                             "conversation_history": json.dumps(current_conversation_history)
                         }).eq("session_token", session_to_update_token).execute()
-                except Exception as e:
+                    except Exception as e:
                         logger.error(f"Failed to update conversation_history for session {session_to_update_token}: {e}", exc_info=True)
 
              except Exception as send_e:
