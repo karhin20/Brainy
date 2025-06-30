@@ -1205,6 +1205,7 @@ async def whatsapp_webhook(request: Request):
         # Only attempt to send if there is a reply message AND the utility is available
         if reply_message and send_whatsapp_message_available:
              try:
+                logger.info(f"DEBUG: Attempting to send message to {from_number_clean}. Content: '{reply_message}'") # NEW DEBUG LOG
                 await send_whatsapp_message(from_number_clean, reply_message)
                 truncated_message = reply_message[:1000]
                 supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
