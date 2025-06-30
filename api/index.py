@@ -21,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Configure logging early
 logging.basicConfig(
-    level=logging.INFO, # Consider changing this to logging.ERROR or logging.CRITICAL in production
+    level=logging.DEBUG, # CHANGE THIS LINE
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
