@@ -242,6 +242,10 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
             - `negative_acknowledgement`: User is providing a negative reply, indicating they don't need further help (e.g., no, nope, that's all, I'm good).
             - `multi_intent`: User is asking for two or more things at once (e.g., "I want to buy tomatoes and where is my order?").
             - `modify_order`: User wants to change, add, or remove items from an order they've just confirmed but haven't paid for yet.
+            - `delivery_preference`: User explicitly states they prefer delivery for their order.
+            - `pickup_preference`: User explicitly states they prefer pickup for their order.
+            - `use_saved_location`: User explicitly states they want to use a previously saved location.
+            - `provide_new_location`: User explicitly states they want to provide a new delivery location.
             - `unknown`: The message is irrelevant to grocery shopping, unclear, or outside the bot's capabilities (e.g., telling a joke, asking for personal details, spam).
 
             Your JSON output MUST contain these two fields:
@@ -258,6 +262,10 @@ async def call_gemini_api(message: str) -> Dict[str, Any]:
                 - `negative_acknowledgement`: "Alright, have a great day! Feel free to message me anytime you need groceries."
                 - `multi_intent`: "I can help with one thing at a time. Please ask about your order status or placing a new order separately."
                 - `modify_order`: "No problem, I can help with that."
+                - `delivery_preference`: "Alright, let's get it delivered."
+                - `pickup_preference`: "Understood, your order is for pickup."
+                - `use_saved_location`: "Okay, I'll use your saved location."
+                - `provide_new_location`: "Please share your new location."
                 - `unknown`: "I'm sorry, I can only help with grocery orders."
 
             Example response format:
@@ -343,6 +351,10 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
              affirmative_keywords = ["ok", "okay", "k", "ok.", "yes", "yeah", "alright", "got it", "sounds good", "sure", "confirm"]
              negative_keywords = ["no", "nope", "no thanks", "no.", "that's all", "i'm good", "nothing else", "not really"]
              modify_keywords = ["add", "change", "modify", "forgot", "remove item", "update order"]
+             delivery_keywords = ["deliver", "delivery", "send to me", "bring to me", "my house", "my address"]
+             pickup_keywords = ["pickup", "pick up", "collect", "at the store", "i'll come for it"]
+             use_saved_location_keywords = ["use saved", "my saved location", "use current", "my location", "this address"]
+             provide_new_location_keywords = ["new location", "new address", "share new", "different location"]
 
              # Multi-intent check
              buy_present = any(word in lower_msg for word in buy_keywords)
@@ -355,6 +367,11 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
 
              if any(word in lower_msg for word in cancel_keywords): return {"intent": "cancel_order", "response": "Okay, I can help with cancelling an order."}
              if any(word in lower_msg for word in status_keywords): return {"intent": "check_status", "response": "Let me check on your order."}
+             if any(word in lower_msg for word in delivery_keywords): return {"intent": "delivery_preference", "response": "Alright, let's get it delivered."}
+             if any(word in lower_msg for word in pickup_keywords): return {"intent": "pickup_preference", "response": "Understood, your order is for pickup."}
+             if any(word in lower_msg for word in use_saved_location_keywords): return {"intent": "use_saved_location", "response": "Okay, I'll use your saved location."}
+             if any(word in lower_msg for word in provide_new_location_keywords): return {"intent": "provide_new_location", "response": "Please share your new location."}
+
              if any(word in lower_msg for word in buy_keywords):
                   return {"intent": "buy", "response": "Great! I can help with that."}
              if any(word in lower_msg for word in greet_keywords):
@@ -961,7 +978,8 @@ async def whatsapp_webhook(request: Request):
             if active_pending_order:
                 # --- Check for specific commands within the current pending state ---
                 if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
-                     if lower_incoming_msg in ["1", "delivery"]:
+                     # Check for delivery or pickup preference intents
+                     if intent == "delivery_preference":
                          handled_by_pending_state = True
                          # User selected Delivery. Check if they have a saved location.
                          if user.get("last_known_location"):
@@ -970,10 +988,7 @@ async def whatsapp_webhook(request: Request):
                                 # Update status to await confirmation for saved location
                                 supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                                 reply_message = (
-                                    "I see you have a saved delivery location with us. Would you like to use it for this order?\n\n"
-                                    "Reply *1* to use saved location\n"
-                                    "Reply *2* to provide a new one (you'll share it via WhatsApp location feature)\n\n"
-                                    "Or reply 'cancel'."
+                                    "I see you have a saved delivery location with us. Would you like to use it for this order or provide a new one?"
                                 )
                              except Exception as e:
                                   logger.error(f"Failed to update order status for location confirmation {order_id}: {e}", exc_info=True)
@@ -992,7 +1007,7 @@ async def whatsapp_webhook(request: Request):
                                   logger.error(f"Failed to update order status to awaiting location {order_id}: {e}", exc_info=True)
                                   reply_message = "Sorry, I had trouble updating your order details. Please try again or reply 'cancel'."
 
-                     elif lower_incoming_msg in ["2", "pickup"]:
+                     elif intent == "pickup_preference":
                           handled_by_pending_state = True
                           try:
                             # Update status to pending payment for pickup
@@ -1009,14 +1024,20 @@ async def whatsapp_webhook(request: Request):
                           except Exception as e:
                               logger.error(f"Failed to finalize pickup order {order_id}: {e}", exc_info=True)
                               reply_message = f"Sorry, I encountered an issue setting up your pickup order and generating the payment link. Please try again in a moment, or reply 'cancel'."
+                     elif intent == "unknown": # If intent is unclear, ask for clarification on delivery/pickup
+                         handled_by_pending_state = True
+                         reply_message = (
+                             "I'm not sure how you'd like to receive your order. "
+                             "Would you prefer *delivery* to your location, or will you *pick up* your order?"
+                         )
 
                 elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
-                    if lower_incoming_msg == "1": # Use saved location
+                    if intent == "use_saved_location": # Use saved location
                         handled_by_pending_state = True
                         location_str = user.get("last_known_location")
 
                         if not location_str:
-                            logger.warning(f"User {user_id} replied '1' to location confirmation but had no saved location. Order {order_id}")
+                            logger.warning(f"User {user_id} replied to use saved location but had no saved location. Order {order_id}")
                             try:
                                 # Revert status to awaiting location sharing
                                 supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
@@ -1081,7 +1102,7 @@ async def whatsapp_webhook(request: Request):
                                 logger.error(f"Error finalizing order {order_id} after using saved location for user {user_id}: {e}", exc_info=True)
                                 reply_message = f"Sorry, I encountered an issue processing your delivery details. Please try again or reply 'cancel'."
 
-                    elif lower_incoming_msg == "2": # Provide a new one
+                    elif intent == "provide_new_location": # Provide a new one
                         handled_by_pending_state = True
                         try:
                             # Update status to await location sharing
@@ -1095,6 +1116,12 @@ async def whatsapp_webhook(request: Request):
                         except Exception as e:
                             logger.error(f"Failed to update status to awaiting new location {order_id}: {e}", exc_info=True)
                             reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
+                    elif intent == "unknown": # If intent is unclear, ask for clarification on location
+                        handled_by_pending_state = True
+                        reply_message = (
+                            "I'm not sure if you want to use your saved location or provide a new one. "
+                            "Could you please clarify? For example, you can say 'use my saved location' or 'I want to share a new location'."
+                        )
 
                 # --- Handle Cancel Command ---
                 # Check for 'cancel' regardless of other state-specific inputs
@@ -1145,49 +1172,67 @@ async def whatsapp_webhook(request: Request):
                                 logger.debug(f"DEBUG: Active pending order {order_id} cancelled due to 'buy' intent. Proceeding to create new session.")
                                 # We'll re-call handle_new_conversation outside this block
 
-                            # 2. Create a new session and link, like in 'buy' intent
-                            session_uuid_obj = uuid.uuid4()
-                            session_token_str = str(session_uuid_obj) # This is the string we want to insert
-                            selection_url = f"{settings.FRONTEND_URL}?session={session_token_str}"
-                            now_utc = datetime.now(timezone.utc)
+                            # If we reached here due to 'modify_order' intent, create new session and link
+                            if not handled_by_pending_state: # Only if active_pending_order was NOT reset (i.e., it was modify_order)
+                                # 2. Create a new session and link, like in 'buy' intent
+                                session_uuid_obj = uuid.uuid4()
+                                session_token_str = str(session_uuid_obj) # This is the string we want to insert
+                                selection_url = f"{settings.FRONTEND_URL}?session={session_token_str}"
+                                now_utc = datetime.now(timezone.utc)
 
-                            # Create the initial history for the *new* session when modifying
-                            # This history already includes the user's message (added in whatsapp_webhook)
-                            # Add the bot's reply to this history
-                            new_session_history_on_modify = current_conversation_history[:]
-                            bot_reply_on_modify = (
-                                f"{ai_ack} To change your items, please make a new selection with this link. "
-                                f"Your previous cart has been cancelled.\n\n{selection_url}"
-                            )
-                            new_session_history_on_modify.append({
-                                "speaker": "bot",
-                                "message": bot_reply_on_modify,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "intent": intent
-                            })
+                                # Create the initial history for the *new* session when modifying
+                                # This history already includes the user's message (added in whatsapp_webhook)
+                                # Add the bot's reply to this history
+                                new_session_history_on_modify = current_conversation_history[:]
+                                bot_reply_on_modify = (
+                                    f"{ai_ack} To change your items, please make a new selection with this link. "
+                                    f"Your previous cart has been cancelled.\n\n{selection_url}"
+                                )
+                                new_session_history_on_modify.append({
+                                    "speaker": "bot",
+                                    "message": bot_reply_on_modify,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "intent": intent
+                                })
 
-                            supabase.table("sessions").insert({
-                                "user_id": user_id,
-                                "phone_number": from_number_clean,
-                                "session_token": session_token_str, # Explicitly pass the string for a VARCHAR column
-                                "created_at": now_utc.isoformat(),
-                                "expires_at": (now_utc + timedelta(hours=24)).isoformat(),
-                                "conversation_history": json.dumps(new_session_history_on_modify) # Store new history
-                            }).execute()
+                                supabase.table("sessions").insert({
+                                    "user_id": user_id,
+                                    "phone_number": from_number_clean,
+                                    "session_token": session_token_str, # Explicitly pass the string for a VARCHAR column
+                                    "created_at": now_utc.isoformat(),
+                                    "expires_at": (now_utc + timedelta(hours=24)).isoformat(),
+                                    "conversation_history": json.dumps(new_session_history_on_modify) # Store new history
+                                }).execute()
 
-                            # Set the global variable to mark this new session for later update in webhook
-                            _newly_created_session_token = session_token_str
-                            reply_message = bot_reply_on_modify # Ensure reply_message is set
-                        
+                                # Set the global variable to mark this new session for later update in webhook
+                                _newly_created_session_token = session_token_str
+                                reply_message = bot_reply_on_modify # Ensure reply_message is set
+                            
                         except Exception as e:
                             logger.error(f"Error modifying pending order {order_id} for user {user_id}: {e}", exc_info=True)
                             reply_message = "I'm sorry, I ran into a problem trying to modify your order. Please try again."
                         
+                    elif intent == "check_status": # Allow checking status even if there's a pending order, but remind about pending
+                        reply_message = f"{ai_ack} Your current order ({order_number}) is *{current_status.replace('_', ' ').title()}*. {ai_ack} {gemini_result.get('response')}" # Combine messages
+                    elif intent in ["delivery_preference", "pickup_preference", "use_saved_location", "provide_new_location"]:
+                        # If user provides a preference when status is not PENDING_CONFIRMATION or AWAITING_LOCATION_CONFIRMATION
+                        reply_message = f"{ai_ack} I've noted your preference, but your current order is already beyond that stage, or is awaiting a different type of input. Your order ({order_number}) is currently *{current_status.replace('_', ' ').title()}*."
+                    elif intent == "unknown":
+                        # General unknown intent when there's an active pending order
+                        reply_message = (
+                            f"I didn't quite understand that. Your order ({order_number}) is currently *{current_status.replace('_', ' ').title()}*. "
+                            "What would you like to do regarding this order? (e.g., 'cancel' or ask about its status)"
+                        )
                     else:
                         # Construct a reminder message based on the current pending status
                         reminder_message = ""
                         if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
-                             reminder_message = "\n\nBut please first choose '1' for Delivery or '2' for Pickup for your pending order."
+                             reminder_message = "\n\nBut before we proceed, how would you like to receive your order: *delivery* or *pickup*?"
+                        elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
+                             reminder_message = "\n\nBut first, would you like to use your *saved location* or *provide a new one*?"
+                        elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION:
+                             reminder_message = "\n\nBut first, please *share your location* for delivery."
+
                         reply_message = ai_ack + reminder_message if reminder_message else ai_ack
 
 
