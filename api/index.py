@@ -355,7 +355,7 @@ async def get_intent_gracefully(message: str, user_context: Dict[str, Any]) -> D
              pickup_keywords = ["pickup", "pick up", "collect", "at the store", "i'll come for it"]
              use_saved_location_keywords = ["use saved", "my saved location", "use current", "my location", "this address"]
              provide_new_location_keywords = ["new location", "new address", "share new", "different location"]
-
+             
              # Multi-intent check
              buy_present = any(word in lower_msg for word in buy_keywords)
              status_present = any(word in lower_msg for word in status_keywords)
@@ -687,7 +687,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
             reply_message = "Thank you! We will update you with changes if there is any."
         else:
             # Generic response for other affirmative acknowledgements
-            reply_message = ai_response_ack
+        reply_message = ai_response_ack
 
     elif intent == "negative_acknowledgement":
         reply_message = ai_response_ack
@@ -816,9 +816,9 @@ async def whatsapp_webhook(request: Request):
                     user_id = user['id'] # Set user_id here
                 else:
                      logger.critical(f"Failed to create new user for {from_number_clean}.")
-                     if send_whatsapp_message_available:
-                        await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
-                     return JSONResponse(content={}, status_code=status.HTTP_200_OK)
+                         if send_whatsapp_message_available:
+                            await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
+                         return JSONResponse(content={}, status_code=status.HTTP_200_OK)
 
             except Exception as e:
                  logger.error(f"Failed to create new user for {from_number_clean}: {e}", exc_info=True)
@@ -826,7 +826,7 @@ async def whatsapp_webhook(request: Request):
                     await send_whatsapp_message(from_number_clean, "Sorry, I'm having trouble setting up your profile right now. Please try again in a moment.")
                  return JSONResponse(content={}, status_code=status.HTTP_200_OK)
         else:
-            user_id = user['id']
+        user_id = user['id']
             # Find the active session and load its history
             if user.get('sessions'):
                 # Assuming sessions list is already sorted by created_at desc due to the select query
@@ -889,6 +889,18 @@ async def whatsapp_webhook(request: Request):
 
         # Determine if it's a media message (other than location, which is handled separately)
         is_media_message = form_data.get("NumMedia", "0") != "0" and not is_location_message
+
+        # --- Get Gemini Intent (always fresh for the current message) ---
+        gemini_result = {"intent": "unknown", "response": "I'm sorry, I couldn't understand that."} # Default fallback
+        user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))}
+
+        if incoming_msg: # Only call Gemini if there's text to analyze
+            gemini_result = await get_intent_gracefully(incoming_msg, user_context)
+            logger.debug(f"DEBUG: Main Gemini intent for incoming text: {gemini_result.get('intent')}")
+        
+        intent = gemini_result.get('intent')
+        ai_ack = gemini_result.get('response', 'Okay.')
+
 
         # --- 2. Find and Clean Up Potentially Multiple Pending Orders ---
         # Find the most recent pending order
@@ -955,65 +967,89 @@ async def whatsapp_webhook(request: Request):
                         f"Please complete your payment here to confirm your order:\n{payment_link}\n\n"
                         "Or reply 'cancel' to cancel the order."
                     )
+                    handled_by_pending_state = True # Location message handled this turn
                 except Exception as e:
                      logger.error(f"Error processing location or finalizing order for user {user_id}, order {order_id}: {e}", exc_info=True)
                      reply_message = f"Sorry, I encountered an issue processing your delivery details. Please try again or contact support."
-
+                     handled_by_pending_state = True # Attempted to handle, but failed. Prevent further processing in this turn.
             else:
                  # User sent a location when we weren't expecting one or no pending order exists
                  reply_message = "Thanks for sharing your location! I've saved it for future delivery orders, but I wasn't expecting it right now. How else can I help you today?"
+                 handled_by_pending_state = True
 
-        # B. Handle Media Message
+        # B. Handle Media Message (if not a location)
         elif is_media_message:
              reply_message = "Thanks for sending that! Currently, I can only process text messages and shared locations. How can I help you with your grocery order?"
+            handled_by_pending_state = True
 
-        # C. Handle incoming Text Message
+        # C. Handle incoming Text Message (if not handled by location/media)
         elif incoming_msg:
             lower_incoming_msg = incoming_msg.lower().strip()
-            handled_by_pending_state = False
-            order_id = active_pending_order['id'] if active_pending_order else None
-            order_number = active_pending_order.get('order_number', order_id) if active_pending_order else None
-            current_status: Optional[OrderStatus] = active_pending_order.get('status') if active_pending_order else None
+            
+            # Handle Cancel Command (high priority regardless of state)
+            if lower_incoming_msg == 'cancel':
+                handled_by_pending_state = True
+                if current_status in [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]:
+                    reply_message = f"This order ({order_number}) is already marked as *{current_status.replace('_', ' ').title()}* and cannot be cancelled."
+                else:
+                    try:
+                        supabase.table("orders").update({
+                            "status": DefaultStatus.ORDER_CANCELLED,
+                            "payment_status": DefaultStatus.PAYMENT_CANCELLED,
+                            "cancelled_at": datetime.now(timezone.utc).isoformat(),
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "cancellation_reason": "user requested cancellation"
+                        }).eq("id", order_id).execute()
+                        reply_message = f"Your order ({order_number}) has been cancelled. Please let me know if there's anything else I can help with."
+                    except Exception as e:
+                        logger.error(f"Failed to cancel order {order_id} for user {user_id}: {e}", exc_info=True)
+                        reply_message = "Sorry, I had trouble cancelling your order right now. Please try again or contact support."
 
-            if active_pending_order:
-                # --- Check for specific commands within the current pending state ---
-                if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
-                     # Check for delivery or pickup preference intents
-                     if intent == "delivery_preference":
+            # Handle 'buy' or 'modify_order' intent to cancel current and start new
+            elif intent == 'modify_order' or intent == 'buy':
                          handled_by_pending_state = True
-                         # User selected Delivery. Check if they have a saved location.
+                try:
+                    supabase.table("orders").update({
+                        "status": DefaultStatus.ORDER_CANCELLED,
+                        "payment_status": DefaultStatus.PAYMENT_CANCELLED,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "cancellation_reason": "user modified selection" if intent == 'modify_order' else "user started new order"
+                    }).eq("id", order_id).execute()
+
+                    logger.debug(f"DEBUG: Active pending order {order_id} cancelled due to '{intent}' intent.")
+                    # Now, proceed to create a new session/order as if there was no active pending order.
+                    # This will be handled by the 'else' block outside this `if active_pending_order` section.
+                    active_pending_order = None # Effectively "reset" the pending order for this session
+                    handled_by_pending_state = False # Allow it to fall through to the new conversation logic
+                    reply_message = "" # Clear reply message so it gets set by handle_new_conversation
+
+                except Exception as e:
+                    logger.error(f"Error modifying/starting new order for user {user_id}: {e}", exc_info=True)
+                    reply_message = "I'm sorry, I ran into a problem trying to modify your order or start a new one. Please try again."
+                    handled_by_pending_state = True # Prevent falling through if an error occurred here
+
+            # Handle state-specific intents
+            elif current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
+                if intent == "delivery_preference":
+                    handled_by_pending_state = True
                          if user.get("last_known_location"):
-                             # User has a saved location, ask if they want to use it
                              try:
-                                # Update status to await confirmation for saved location
                                 supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
-                                reply_message = (
-                                    "I see you have a saved delivery location with us. Would you like to use it for this order or provide a new one?"
-                                )
+                            reply_message = "I see you have a saved delivery location with us. Would you like to *use that* for this order, or *provide a new one*?"
                              except Exception as e:
-                                  logger.error(f"Failed to update order status for location confirmation {order_id}: {e}", exc_info=True)
+                            logger.error(f"Failed to update order status to AWAITING_LOCATION_CONFIRMATION for {order_id}: {e}", exc_info=True)
                                   reply_message = "Sorry, I had trouble updating your order details. Please try again or reply 'cancel'."
                          else:
-                             # User has no saved location, ask them to share it
                              try:
-                                # Update status to await location sharing
                                 supabase.table("orders").update({"delivery_type": "delivery", "status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
-                                reply_message = (
-                                    "Great! Please share your delivery location using the WhatsApp location sharing feature.\n\n"
-                                    "Tap the *clip icon 📎* next to the message box, then choose *'Location' 📍* and select 'Send your current location' or a nearby place.\n\n"
-                                    "Or reply 'cancel'."
-                                )
+                            reply_message = "Great! Please share your delivery location using the WhatsApp location sharing feature. Tap the *clip icon 📎* next to the message box, then choose *'Location' 📍* and select 'Send your current location' or a nearby place.\n\nOr reply 'cancel'."
                              except Exception as e:
-                                  logger.error(f"Failed to update order status to awaiting location {order_id}: {e}", exc_info=True)
+                            logger.error(f"Failed to update order status to AWAITING_LOCATION for {order_id}: {e}", exc_info=True)
                                   reply_message = "Sorry, I had trouble updating your order details. Please try again or reply 'cancel'."
-
-                     elif intent == "pickup_preference":
+                elif intent == "pickup_preference":
                           handled_by_pending_state = True
                           try:
-                            # Update status to pending payment for pickup
                             supabase.table("orders").update({"delivery_type": "pickup", "status": DefaultStatus.ORDER_PENDING_PAYMENT, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
-
-                            # Generate payment link for the original total amount
                             payment_link = await generate_paystack_payment_link(order_id, active_pending_order['total_amount'], from_number_clean)
                             reply_message = (
                                 f"Alright, your order is set for pickup.\n\n"
@@ -1024,44 +1060,29 @@ async def whatsapp_webhook(request: Request):
                           except Exception as e:
                               logger.error(f"Failed to finalize pickup order {order_id}: {e}", exc_info=True)
                               reply_message = f"Sorry, I encountered an issue setting up your pickup order and generating the payment link. Please try again in a moment, or reply 'cancel'."
-                     elif intent == "unknown": # If intent is unclear, ask for clarification on delivery/pickup
-                         handled_by_pending_state = True
-                         reply_message = (
-                             "I'm not sure how you'd like to receive your order. "
-                             "Would you prefer *delivery* to your location, or will you *pick up* your order?"
-                         )
+                elif intent == "unknown":
+                    handled_by_pending_state = True
+                    reply_message = "I'm not sure how you'd like to receive your order. Would you prefer *delivery* to your location, or will you *pick up* your order?"
 
                 elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
-                    if intent == "use_saved_location": # Use saved location
+                if intent == "use_saved_location":
                         handled_by_pending_state = True
                         location_str = user.get("last_known_location")
-
                         if not location_str:
-                            logger.warning(f"User {user_id} replied to use saved location but had no saved location. Order {order_id}")
+                        logger.warning(f"User {user_id} replied to use saved location but had no saved location. Order {order_id}")
                             try:
-                                # Revert status to awaiting location sharing
                                 supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
-                                reply_message = (
-                                    "It seems your saved location wasn't available.\n\n"
-                                    "Please share your delivery location again using the WhatsApp location sharing feature.\n"
-                                    "Tap the *clip icon 📎* next to the message box, then choose *'Location' 📍*.\n\n"
-                                    "Or reply 'cancel'."
-                                )
+                            reply_message = "It seems your saved location wasn't available. Please share your delivery location again using the WhatsApp location sharing feature.\nTap the *clip icon 📎* next to the message box, then choose *'Location' 📍*.\n\nOr reply 'cancel'."
                             except Exception as e:
-                                logger.error(f"Failed to update status to awaiting location after missing saved loc {order_id}: {e}", exc_info=True)
+                            logger.error(f"Failed to update status to AWAITING_LOCATION after missing saved loc {order_id}: {e}", exc_info=True)
                                 reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
                         else:
-                            # Saved location exists, use it to finalize the order
                             try:
                                 location_data = json.loads(location_str)
                                 latitude = float(location_data.get("latitude"))
                                 longitude = float(location_data.get("longitude"))
-
-                                # Calculate fee and total with delivery for the saved location
                                 delivery_fee = calculate_delivery_fee(latitude, longitude)
                                 total_with_delivery = active_pending_order['total_amount'] + delivery_fee
-
-                                # Update order with delivery details and move to pending payment
                                 update_data = {
                                     "status": DefaultStatus.ORDER_PENDING_PAYMENT,
                                     "delivery_type": "delivery",
@@ -1072,8 +1093,6 @@ async def whatsapp_webhook(request: Request):
                                     "updated_at": datetime.now(timezone.utc).isoformat()
                                 }
                                 supabase.table("orders").update(update_data).eq("id", order_id).execute()
-
-                                # Generate payment link for the total including delivery fee
                                 payment_link = await generate_paystack_payment_link(order_id, total_with_delivery, from_number_clean)
                                 reply_message = (
                                     f"Using your saved location. The delivery fee is GHS {delivery_fee:.2f}.\n\n"
@@ -1081,174 +1100,51 @@ async def whatsapp_webhook(request: Request):
                                     f"Please complete your payment here:\n{payment_link}\n\n"
                                     "Or reply 'cancel'."
                                 )
-                            except (ValueError, TypeError, json.JSONDecodeError) as e:
-                                # Handle errors if the saved location data is invalid or fee calculation fails
-                                logger.error(f"Invalid saved location data or fee processing error for user {user_id}: {location_str}. Error: {e}", exc_info=True)
-                                try:
-                                    # Revert status to awaiting location sharing if saved data was bad
-                                    supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
-                                    reply_message = (
-                                        "It seems there was an issue with your saved location data.\n\n"
-                                        "Please share your delivery location again using the WhatsApp location sharing feature.\n"
-                                        "Tap the *clip icon 📎* next to the message box, then choose *'Location' 📍*.\n\n"
-                                        "Or reply 'cancel'."
-                                    )
-                                except Exception as update_e:
-                                     logger.error(f"Failed to update status to awaiting location after invalid saved loc {order_id}: {update_e}", exc_info=True)
-                                     reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
-
                             except Exception as e:
-                                # Catch other errors during the finalization process
                                 logger.error(f"Error finalizing order {order_id} after using saved location for user {user_id}: {e}", exc_info=True)
                                 reply_message = f"Sorry, I encountered an issue processing your delivery details. Please try again or reply 'cancel'."
-
-                    elif intent == "provide_new_location": # Provide a new one
+                elif intent == "provide_new_location":
                         handled_by_pending_state = True
                         try:
-                            # Update status to await location sharing
                             supabase.table("orders").update({"status": DefaultStatus.ORDER_AWAITING_LOCATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
-                            reply_message = (
-                                "Okay, no problem.\n\n"
-                                "Please share your new delivery location using the WhatsApp location sharing feature.\n"
-                                "Tap the *clip icon 📎* next to the message box, then choose *'Location' 📍*.\n\n"
-                                "Or reply 'cancel'."
-                            )
+                        reply_message = "Okay, no problem. Please share your new delivery location using the WhatsApp location sharing feature.\nTap the *clip icon 📎* next to the message box, then choose *'Location' 📍*.\n\nOr reply 'cancel'."
                         except Exception as e:
-                            logger.error(f"Failed to update status to awaiting new location {order_id}: {e}", exc_info=True)
+                        logger.error(f"Failed to update status to AWAITING_LOCATION for {order_id}: {e}", exc_info=True)
                             reply_message = "Sorry, I had trouble processing your request. Please try again or reply 'cancel'."
-                    elif intent == "unknown": # If intent is unclear, ask for clarification on location
+                elif intent == "unknown":
                         handled_by_pending_state = True
-                        reply_message = (
-                            "I'm not sure if you want to use your saved location or provide a new one. "
-                            "Could you please clarify? For example, you can say 'use my saved location' or 'I want to share a new location'."
-                        )
+                    reply_message = "I'm not sure if you want to use your saved location or provide a new one. Could you please clarify? For example, you can say 'use my saved location' or 'I want to share a new location'."
 
-                # --- Handle Cancel Command ---
-                # Check for 'cancel' regardless of other state-specific inputs
-                if lower_incoming_msg == 'cancel':
-                    handled_by_pending_state = True # Mark as handled
-                    if current_status in [DefaultStatus.ORDER_CANCELLED, DefaultStatus.ORDER_DELIVERED, DefaultStatus.ORDER_FAILED]:
-                         reply_message = f"This order ({order_number}) is already marked as *{current_status.replace('_', ' ').title()}* and cannot be cancelled."
-                    else:
-                         try:
-                            # Update order status to cancelled
-                            supabase.table("orders").update({
-                                "status": DefaultStatus.ORDER_CANCELLED,
-                                "payment_status": DefaultStatus.PAYMENT_CANCELLED, # Also mark payment as cancelled
-                                "cancelled_at": datetime.now(timezone.utc).isoformat(),
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                                "cancellation_reason": "user requested cancellation"
-                            }).eq("id", order_id).execute()
-                            reply_message = f"Your order ({order_number}) has been cancelled. Please let me know if there's anything else I can help with."
-                         except Exception as e:
-                            logger.error(f"Failed to cancel order {order_id} for user {user_id}: {e}", exc_info=True)
-                            reply_message = "Sorry, I had trouble cancelling your order right now. Please try again or contact support."
-
-
-                # --- Handle messages that are *not* state-specific commands ---
-                # If the message wasn't a state-specific command (like 1, 2, cancel)
-                if not handled_by_pending_state:
-                    user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))} # Context might be useful for Gemini
-                    gemini_result = await get_intent_gracefully(incoming_msg, user_context)
-                    logger.debug(f"DEBUG: Gemini intent for active pending order path: {gemini_result.get('intent')}")
-                    intent = gemini_result.get('intent')
-                    ai_ack = gemini_result.get('response', 'Okay.')
-
-                    if intent == 'modify_order' or intent == 'buy': # <-- ADDED 'or intent == 'buy''
-                        handled_by_pending_state = True
-                        try:
-                            # 1. Cancel the current pending order
-                            supabase.table("orders").update({
-                                "status": DefaultStatus.ORDER_CANCELLED,
-                                "payment_status": DefaultStatus.PAYMENT_CANCELLED,
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                                "cancellation_reason": "user modified selection" if intent == 'modify_order' else "user started new order" # <-- UPDATED REASON
-                            }).eq("id", order_id).execute()
-
-                            # If 'buy' intent, effectively reset pending order state to create new session
-                            if intent == 'buy':
-                                active_pending_order = None # This will force the flow into the else block below
-                                handled_by_pending_state = False # This ensures handle_new_conversation is called
-                                logger.debug(f"DEBUG: Active pending order {order_id} cancelled due to 'buy' intent. Proceeding to create new session.")
-                                # We'll re-call handle_new_conversation outside this block
-
-                            # If we reached here due to 'modify_order' intent, create new session and link
-                            if not handled_by_pending_state: # Only if active_pending_order was NOT reset (i.e., it was modify_order)
-                                # 2. Create a new session and link, like in 'buy' intent
-                                session_uuid_obj = uuid.uuid4()
-                                session_token_str = str(session_uuid_obj) # This is the string we want to insert
-                                selection_url = f"{settings.FRONTEND_URL}?session={session_token_str}"
-                                now_utc = datetime.now(timezone.utc)
-
-                                # Create the initial history for the *new* session when modifying
-                                # This history already includes the user's message (added in whatsapp_webhook)
-                                # Add the bot's reply to this history
-                                new_session_history_on_modify = current_conversation_history[:]
-                                bot_reply_on_modify = (
-                                    f"{ai_ack} To change your items, please make a new selection with this link. "
-                                    f"Your previous cart has been cancelled.\n\n{selection_url}"
-                                )
-                                new_session_history_on_modify.append({
-                                    "speaker": "bot",
-                                    "message": bot_reply_on_modify,
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "intent": intent
-                                })
-
-                                supabase.table("sessions").insert({
-                                    "user_id": user_id,
-                                    "phone_number": from_number_clean,
-                                    "session_token": session_token_str, # Explicitly pass the string for a VARCHAR column
-                                    "created_at": now_utc.isoformat(),
-                                    "expires_at": (now_utc + timedelta(hours=24)).isoformat(),
-                                    "conversation_history": json.dumps(new_session_history_on_modify) # Store new history
-                                }).execute()
-
-                                # Set the global variable to mark this new session for later update in webhook
-                                _newly_created_session_token = session_token_str
-                                reply_message = bot_reply_on_modify # Ensure reply_message is set
-                            
-                        except Exception as e:
-                            logger.error(f"Error modifying pending order {order_id} for user {user_id}: {e}", exc_info=True)
-                            reply_message = "I'm sorry, I ran into a problem trying to modify your order. Please try again."
-                        
-                    elif intent == "check_status": # Allow checking status even if there's a pending order, but remind about pending
-                        reply_message = f"{ai_ack} Your current order ({order_number}) is *{current_status.replace('_', ' ').title()}*. {ai_ack} {gemini_result.get('response')}" # Combine messages
-                    elif intent in ["delivery_preference", "pickup_preference", "use_saved_location", "provide_new_location"]:
-                        # If user provides a preference when status is not PENDING_CONFIRMATION or AWAITING_LOCATION_CONFIRMATION
-                        reply_message = f"{ai_ack} I've noted your preference, but your current order is already beyond that stage, or is awaiting a different type of input. Your order ({order_number}) is currently *{current_status.replace('_', ' ').title()}*."
-                    elif intent == "unknown":
-                        # General unknown intent when there's an active pending order
-                        reply_message = (
-                            f"I didn't quite understand that. Your order ({order_number}) is currently *{current_status.replace('_', ' ').title()}*. "
-                            "What would you like to do regarding this order? (e.g., 'cancel' or ask about its status)"
-                        )
-                    else:
-                        # Construct a reminder message based on the current pending status
+            elif intent == "check_status": # Allow checking status even if there's a pending order, but remind about pending
+                reply_message = f"{ai_ack} Your current order ({order_number}) is *{current_status.replace('_', ' ').title()}*."
+                handled_by_pending_state = True
+            elif not handled_by_pending_state: # If none of the above specific states were handled, and it's not a known command
+                # Generic reminder for pending order if the message wasn't a specific command for the state
                         reminder_message = ""
                         if current_status == DefaultStatus.ORDER_PENDING_CONFIRMATION:
-                             reminder_message = "\n\nBut before we proceed, how would you like to receive your order: *delivery* or *pickup*?"
-                        elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
-                             reminder_message = "\n\nBut first, would you like to use your *saved location* or *provide a new one*?"
-                        elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION:
-                             reminder_message = "\n\nBut first, please *share your location* for delivery."
+                    reminder_message = "How would you like to receive your order: *delivery* or *pickup*?"
+                elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION_CONFIRMATION:
+                    reminder_message = "Would you like to use your *saved location* or *provide a new one*?"
+                elif current_status == DefaultStatus.ORDER_AWAITING_LOCATION:
+                    reminder_message = "Please *share your location* for delivery."
+                elif current_status == DefaultStatus.ORDER_PENDING_PAYMENT:
+                    reminder_message = f"Your order is awaiting payment. Please complete payment at the link provided earlier, or reply 'cancel'."
+                else:
+                    reminder_message = "What would you like to do regarding this order? (e.g., 'cancel' or ask about its status)"
 
-                        reply_message = ai_ack + reminder_message if reminder_message else ai_ack
+                if intent == "unknown":
+                    reply_message = f"I didn't quite understand that. {reminder_message}"
+                else: # If intent was recognized but not handled by specific state, provide general ack + reminder
+                     reply_message = f"{ai_ack} {reminder_message}"
+                handled_by_pending_state = True
 
 
             # --- Handle incoming Text Message when NO active pending order exists ---
-            else: # No active pending order
-                logger.debug(f"DEBUG: No active pending order. Calling handle_new_conversation.")
-                # Determine intent for a new conversation
-                user_context = {'has_paid_order': False, 'has_saved_address': bool(user.get("last_known_location"))} # Provide relevant user context
-                gemini_result = await get_intent_gracefully(incoming_msg, user_context)
-                logger.debug(f"DEBUG: Gemini intent for new conversation path: {gemini_result.get('intent')}")
+        if not handled_by_pending_state: # This ensures we only proceed if no pending order was found or it was explicitly cancelled to start new.
+            logger.debug(f"DEBUG: No active pending order (or cancelled to start new). Calling handle_new_conversation.")
                 # Call handle_new_conversation to get the appropriate response based on intent
-                # Pass current_conversation_history which only contains the user's message at this point
-                reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg, current_conversation_history)
-                logger.debug(f"DEBUG: Reply message from handle_new_conversation: {reply_message[:50]}...") # Log truncated reply
-                                                                                                        # ^ Pass original_message here
-
+            reply_message = await handle_new_conversation(user, gemini_result, from_number_clean, is_new_user, incoming_msg, current_conversation_history)
+            logger.debug(f"DEBUG: Reply message from handle_new_conversation: {reply_message[:50]}...")
 
         # D. Handle empty or unhandled message type (if no text, location, or media was processed)
         # This block executes if none of the specific message type handlers above set a reply_message
@@ -1268,7 +1164,7 @@ async def whatsapp_webhook(request: Request):
              try:
                 await send_whatsapp_message(from_number_clean, reply_message)
                 truncated_message = reply_message[:1000]
-                supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
+                    supabase.table("users").update({"last_bot_message": truncated_message}).eq("id", user_id).execute();
 
                 # Add BOT message to conversation history for existing session or if not already added by handle_new_conversation
                 # Check if the last entry is *not* a bot message with the current reply_message
@@ -1298,7 +1194,7 @@ async def whatsapp_webhook(request: Request):
                         supabase.table("sessions").update({
                             "conversation_history": json.dumps(current_conversation_history)
                         }).eq("session_token", session_to_update_token).execute()
-                    except Exception as e:
+                except Exception as e:
                         logger.error(f"Failed to update conversation_history for session {session_to_update_token}: {e}", exc_info=True)
 
              except Exception as send_e:
