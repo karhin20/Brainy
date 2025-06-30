@@ -575,7 +575,7 @@ async def handle_new_conversation(user: Dict[str, Any], gemini_result: Dict[str,
                 "expires_at": (now_utc + timedelta(hours=24)).isoformat(),
                 "conversation_history": json.dumps(new_session_history) # Store the history as JSON string
             }).execute()
-            logger.debug(f"DEBUG: Supabase session insert result data: {insert_res.data}. Supabase session insert result error: {insert_res.error}")
+            logger.debug(f"DEBUG: Supabase session insert result data: {insert_res.data}") # REMOVED '.error'
             # Check result for success if the supabase client version supports it returning data/status
             if not insert_res.data:
                 logger.warning(f"Supabase session insert executed but returned no data for user {user_id}, token {session_token_str}.")
