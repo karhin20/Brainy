@@ -75,10 +75,11 @@ if public_router: app.include_router(public_router.router)
 async def get_intent_with_context(user_message: str, last_bot_message: Optional[str] = None) -> Dict[str, Any]:
     if not settings.GEMINI_API_KEY:
         lower_msg = user_message.lower()
-        if any(word in lower_msg for word in ["buy", "menu"]): return {"intent": "start_order"}
-        if any(word in lower_msg for word in ["status"]): return {"intent": "check_status"}
-        if any(word in lower_msg for word in ["no", "good", "moment", "all"]): return {"intent": "end_conversation"}
-        if any(word in lower_msg for word in ["thank", "ok"]): return {"intent": "polite_acknowledgement"}
+        if any(word in lower_msg for word in ["buy", "menu", "order food"]): return {"intent": "start_order"}
+        if any(word in lower_msg for word in ["status", "where is my order", "order update"]): return {"intent": "check_status"}
+        if any(word in lower_msg for word in ["no", "good", "moment", "all", "nothing else"]): return {"intent": "end_conversation"}
+        if any(word in lower_msg for word in ["thank", "ok", "got it", "thanks"]): return {"intent": "polite_acknowledgement"}
+        if any(word in lower_msg for word in ["cart", "items", "my order", "my items", "what have i selected"]): return {"intent": "show_cart"}
         return {"intent": "greet"}
 
     prompt = f"""
@@ -94,6 +95,7 @@ async def get_intent_with_context(user_message: str, last_bot_message: Optional[
     - `check_status`: User is asking about an existing order's status.
     - `polite_acknowledgement`: User is saying "thanks", "ok", "got it". This is a polite but potentially open-ended reply.
     - `end_conversation`: User is clearly ending the conversation. Examples: "no thanks", "I am good", "that's all", "not at the moment". This is a closing statement.
+    - `show_cart`: User is asking to see the items currently in their shopping cart or pending order.
     - `greet`: A general greeting or question that doesn't fit other categories. This is a conversation starter.
 
     Example 1:
@@ -173,6 +175,36 @@ async def whatsapp_webhook(request: Request):
             paid_order_res = supabase.table("orders").select("status, order_number").eq("user_id", user_id).eq("payment_status", "paid").order("created_at", desc=True).limit(1).execute()
             reply_message = f"Your most recent order ({paid_order_res.data[0]['order_number']}) is currently '{paid_order_res.data[0]['status']}'." if paid_order_res.data else "It looks like you don't have any active orders with us. To start one, just say 'menu'."
         
+        elif intent == 'show_cart':
+            # Find the latest pending unpaid order for this user
+            pending_order_res = supabase.table("orders").select("items_json, total_amount, status").eq("user_id", user_id).eq("payment_status", "unpaid").order("created_at", desc=True).limit(1).execute()
+            if pending_order_res.data:
+                pending_order = pending_order_res.data[0]
+                items = pending_order.get("items_json", [])
+                total_amount = pending_order.get("total_amount", 0.0)
+
+                if items:
+                    cart_summary = "🛒 *Your Current Cart:*\n"
+                    for item in items:
+                        # Assuming 'item' has 'name' and 'quantity' or 'product_id' and we need to fetch name
+                        # For now, let's assume 'name' is directly available or use product_id
+                        # In a real app, you'd join with a products table to get names
+                        product_name = item.get("name", f"Product ID: {item.get('product_id', 'N/A')}")
+                        quantity = item.get("quantity", 1)
+                        cart_summary += f"- {product_name} x {quantity}\n"
+                    cart_summary += f"\n*Total: GHS {total_amount:.2f}*\n\n"
+                    if pending_order.get("status") == "pending_confirmation":
+                        cart_summary += "Please select *delivery* or *pickup* to proceed with your order."
+                    elif pending_order.get("status") == "awaiting_location":
+                        cart_summary += "Please share your location for delivery to finalize your order."
+                    elif pending_order.get("status") == "pending_payment":
+                        cart_summary += "Your order is awaiting payment. Please complete the payment to finalize."
+                    reply_message = cart_summary
+                else:
+                    reply_message = "Your cart is currently empty. To start an order, just say 'menu'."
+            else:
+                reply_message = "You don't have any items in your cart or a pending order. To start an order, just say 'menu'."
+
         elif intent == 'polite_acknowledgement':
             reply_message = "You're welcome! Is there anything else I can help with?"
 
@@ -210,8 +242,19 @@ async def confirm_items(request: OrderRequest):
     order_res = supabase.table("orders").insert(order_data).execute()
     if not order_res.data: raise HTTPException(500, "Could not create order")
 
-    reply = (f"Thank you! Your cart with a subtotal of *GHS {request.total_amount:.2f}* is confirmed.\n\n"
-             "To proceed, would you like *delivery* or will you *pickup* the order yourself?")
+    # Build the list of ordered items
+    ordered_items_list = "Here's what you ordered:\n"
+    for item in request.items:
+        product_name = item.get("name", f"Product ID: {item.get('product_id', 'N/A')}") # Assuming 'name' is available
+        quantity = item.get("quantity", 1)
+        ordered_items_list += f"- {product_name} x {quantity}\n"
+
+    reply = (
+        f"Thank you for confirming your items!\n\n"
+        f"{ordered_items_list}\n" # Insert the list of items here
+        f"Your cart with a subtotal of *GHS {request.total_amount:.2f}* is confirmed.\n\n"
+        "To proceed, would you like *delivery* or will you *pickup* the order yourself?"
+    )
     await send_and_save_message(phone_number, reply, user_id)
     
     return {"status": "order_confirmed_on_whatsapp", "order_id": order_res.data[0]['id']}
