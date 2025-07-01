@@ -59,7 +59,13 @@ class OrderRequest(BaseModel):
     session_token: str; items: List[Dict]; total_amount: float
 
 app = FastAPI(title="WhatsApp MarketBot API (Improved Flow)", version="3.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*", "https://marketmenu.vercel.app"], # Restrict this in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 if security and admin_router: app.include_router(admin_router.router, prefix="/admin", tags=["admin"], dependencies=[Depends(security.get_admin_user)])
 if auth_router: app.include_router(auth_router.router, prefix="/auth", tags=["auth"])
 if public_router: app.include_router(public_router.router)
