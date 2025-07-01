@@ -1,4 +1,4 @@
-# --- START OF FILE: index_conversational.py (FINAL, INTEGRATED & FIXED VERSION) ---
+# --- START OF FILE: index.py (FINAL, FULLY INTEGRATED VERSION) ---
 
 import os
 import sys
@@ -21,14 +21,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # --- Project Specific Imports ---
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# --- MOVED UP: Configure logging early to catch all startup errors ---
+# --- Configure logging early to catch all startup errors ---
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- REVISED: Import logic for Supabase, Utils, and other local modules ---
+# --- Corrected Import Logic for Supabase, Utils, and other local modules ---
 try:
     from supabase_client import supabase
     logger.info("Supabase client imported successfully.")
@@ -37,12 +37,10 @@ except ImportError:
     logger.error("Supabase client not found or failed to import. Database operations will be unavailable.")
 
 try:
-    # We only import the function, not an availability flag.
     from .utils import send_whatsapp_message
     send_whatsapp_message_available = True
     logger.info("Successfully imported send_whatsapp_message utility.")
 except ImportError:
-    # If the import fails, we create a dummy function and set the flag to False.
     send_whatsapp_message_available = False
     async def send_whatsapp_message(to: str, body: str):
         logger.error(f"send_whatsapp_message utility is NOT AVAILABLE. Tried to send to {to}: {body}")
@@ -72,7 +70,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# --- MODIFIED: Constants & Statuses to include 'draft' ---
+# --- Constants & Statuses ---
 OrderStatus = Literal[
     "draft", "pending_confirmation", "awaiting_location", "awaiting_location_confirmation",
     "pending_payment", "processing", "out-for-delivery", "delivered", "cancelled", "failed"
@@ -104,10 +102,9 @@ class OrderRequest(BaseModel):
     total_amount: float
 
 # --- FastAPI App Initialization & Middleware ---
-app = FastAPI(title="WhatsApp MarketBot API (Conversational)", version="2.0.0")
+app = FastAPI(title="WhatsApp MarketBot API (Conversational)", version="2.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Include Routers if they were imported successfully
 if security and admin_router: app.include_router(admin_router.router, prefix="/admin", tags=["admin"], dependencies=[Depends(security.get_admin_user)])
 if auth_router: app.include_router(auth_router.router, prefix="/auth", tags=["auth"])
 if public_router: app.include_router(public_router.router)
@@ -158,14 +155,15 @@ User: "delivery" / Status: "pending_confirmation" -> JSON: {{"action": "SET_DELI
             response = await client.post(settings.GEMINI_API_URL, headers={"Content-Type": "application/json"}, params={"key": settings.GEMINI_API_KEY}, json=payload)
             response.raise_for_status()
             result_json = response.json()
-            json_text = result_json["candidates"][0]["content"]["parts"][0]["text"]
+            json_text = result_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
+            if not json_text: raise ValueError("Gemini API returned empty text payload")
             return json.loads(json_text)
     except Exception as e:
         logger.error(f"Error in call_ai_assistant: {e}", exc_info=True)
         return {"action": "UNKNOWN", "response": "I'm having a little trouble processing that. Could you please rephrase?"}
 
-# --- HELPER FUNCTIONS FOR CONVERSATIONAL ACTIONS ---
-async def handle_add_to_cart(user: Dict, order: Dict, entities: List[Dict]) -> None:
+# --- HELPER FUNCTIONS ---
+async def handle_add_to_cart(order: Dict, entities: List[Dict]) -> None:
     if not supabase or not entities: return
     order_id, current_items, new_total = order['id'], order.get('items_json') or [], order.get('total_amount') or 0.0
     for entity in entities:
@@ -173,19 +171,27 @@ async def handle_add_to_cart(user: Dict, order: Dict, entities: List[Dict]) -> N
         current_items.append({"product": product_name, "quantity": quantity, "price": mock_price})
         new_total += mock_price
     try:
-        supabase.table("orders").update({"items_json": current_items, "total_amount": new_total, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
+        supabase.table("orders").update({
+            "items_json": current_items,
+            "total_amount": new_total,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", order_id).execute()
     except Exception as e:
         logger.error(f"Failed to update cart for order {order_id}: {e}", exc_info=True)
         raise
 
-async def handle_confirm_order(user: Dict, order: Dict) -> str:
+async def handle_confirm_order(order: Dict) -> str:
     if not supabase: return "Database is currently unavailable."
     order_id, total_amount = order['id'], order.get('total_amount', 0.0)
     items = order.get('items_json', [])
-    if not items: return "Your cart is empty! Please add some items first."
+    if not items: return "Your cart is empty! Please add some items before we can continue."
+    
     items_summary = "\n".join([f"- {item['quantity']} of {item['product']}" for item in items])
     try:
-        supabase.table("orders").update({"status": DefaultStatus.ORDER_PENDING_CONFIRMATION, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
+        supabase.table("orders").update({
+            "status": DefaultStatus.ORDER_PENDING_CONFIRMATION,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", order_id).execute()
         return (
             f"Great! Here is your order summary:\n{items_summary}\n\n"
             f"Your subtotal is *GHS {total_amount:.2f}*.\n\n"
@@ -195,10 +201,12 @@ async def handle_confirm_order(user: Dict, order: Dict) -> str:
         logger.error(f"Failed to confirm order {order_id}: {e}", exc_info=True)
         return "I had trouble confirming your order. Please try again."
 
+def generate_order_number():
+    return f"ORD-{int(datetime.now(timezone.utc).timestamp())}"
+
 # --- PRIMARY CONVERSATIONAL WEBHOOK ---
 @app.post("/whatsapp-webhook")
 async def whatsapp_webhook(request: Request):
-    """ Main webhook endpoint for the conversational flow. """
     from_number_clean = "unknown"
     try:
         form_data = await request.form()
@@ -214,14 +222,10 @@ async def whatsapp_webhook(request: Request):
             return JSONResponse(content={}, status_code=200)
 
         user_res = supabase.table("users").select("*").eq("phone_number", from_number_clean).limit(1).execute()
-        if user_res.data:
-            user = user_res.data[0]
-        else:
-            user = supabase.table("users").insert({"phone_number": from_number_clean}).execute().data[0]
+        user = user_res.data[0] if user_res.data else supabase.table("users").insert({"phone_number": from_number_clean}).execute().data[0]
         user_id = user['id']
 
         conversation_history = [{"speaker": "user", "message": incoming_msg}]
-
         active_order_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", DefaultStatus.ORDER_DRAFT).order("created_at", desc=True).limit(1).execute()
         active_order = active_order_res.data[0] if active_order_res.data else None
         
@@ -231,23 +235,31 @@ async def whatsapp_webhook(request: Request):
         reply_message = ai_response or "I'm not sure how to respond to that."
         
         logger.debug(f"AI Decision for {from_number_clean}: Action='{action}'")
-        
+
+        # Define a default payload for a new, empty draft order to prevent NOT NULL errors.
+        new_order_payload = {
+            "user_id": user_id,
+            "status": DefaultStatus.ORDER_DRAFT,
+            "items_json": [],
+            "total_amount": 0
+        }
+
         if action == 'START_ORDER':
             if not active_order:
-                active_order = supabase.table("orders").insert({"user_id": user_id, "status": DefaultStatus.ORDER_DRAFT}).execute().data[0]
+                active_order = supabase.table("orders").insert(new_order_payload).execute().data[0]
         
         elif action == 'ADD_TO_CART':
             if not active_order:
-                active_order = supabase.table("orders").insert({"user_id": user_id, "status": DefaultStatus.ORDER_DRAFT}).execute().data[0]
-            await handle_add_to_cart(user, active_order, ai_decision.get("entities", []))
+                active_order = supabase.table("orders").insert(new_order_payload).execute().data[0]
+            await handle_add_to_cart(active_order, ai_decision.get("entities", []))
 
         elif action == 'CONFIRM_ORDER':
             if active_order:
-                reply_message = await handle_confirm_order(user, active_order)
+                reply_message = await handle_confirm_order(active_order)
             else:
                 reply_message = "You don't have an active order to confirm. To start, just tell me what you'd like to buy."
-
-        # (Other action handlers like CHECK_STATUS, CANCEL_ORDER, SET_DELIVERY_PREFERENCE etc. would go here)
+        
+        # (Add other action handlers here as needed, e.g., CHECK_STATUS, CANCEL_ORDER)
 
         if reply_message and send_whatsapp_message_available:
             await send_whatsapp_message(from_number_clean, reply_message)
@@ -261,13 +273,8 @@ async def whatsapp_webhook(request: Request):
 
 
 # --- WEB-BASED & OTHER ENDPOINTS ---
-
-def generate_order_number():
-    return f"ORD-{int(datetime.now(timezone.utc).timestamp())}"
-
 @app.post("/confirm-items")
 async def confirm_items(request: OrderRequest, api_key: str = (Security(security.verify_api_key) if security else None)):
-    """ Endpoint for the web menu. Bypasses 'draft' and creates a 'pending_confirmation' order. """
     if not supabase or not security: raise HTTPException(500, "Server module unavailable")
     
     session_res = supabase.table("sessions").select("user_id, phone_number").eq("session_token", request.session_token).limit(1).execute()
@@ -317,10 +324,12 @@ async def confirm_items(request: OrderRequest, api_key: str = (Security(security
 
 @app.post("/payment-success")
 async def payment_success_webhook(request: Request):
-    """ Webhook for Paystack payment events. This logic doesn't need to change. """
-    # This endpoint logic remains complex but doesn't need to be aware of the 'draft' state,
-    # as payments only happen on orders that are already confirmed.
-    # You can paste your full, original /payment-success logic here.
-    # For brevity, I'll add a placeholder.
-    logger.info("Received a call to /payment-success webhook.")
+    # This logic operates on orders that are already confirmed, so it doesn't need
+    # to be aware of the 'draft' state. The original logic can be pasted here.
+    logger.info("Received a call to /payment-success webhook. (Logic is a placeholder)")
+    # --- PASTE YOUR FULL, ORIGINAL /payment-success LOGIC HERE ---
     return JSONResponse(status_code=200, content={"status": "received"})
+
+@app.get("/")
+async def root():
+    return {"message": "WhatsApp MarketBot Backend (Conversational) is running."}
