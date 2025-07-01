@@ -184,14 +184,25 @@ async def whatsapp_webhook(request: Request):
                 total_amount = pending_order.get("total_amount", 0.0)
 
                 if items:
+                    # Collect all product_ids from the cart items
+                    product_ids = [item.get("product_id") for item in items if item.get("product_id")]
+                    
+                    product_names_map = {}
+                    if product_ids:
+                        # Fetch product names AND prices from the database
+                        products_res = supabase.table("products").select("id, name, price").in_("id", product_ids).execute()
+                        if products_res.data:
+                            product_names_map = {p["id"]: {"name": p["name"], "price": p["price"]} for p in products_res.data}
+
                     cart_summary = "🛒 *Your Current Cart:*\n"
                     for item in items:
-                        # Assuming 'item' has 'name' and 'quantity' or 'product_id' and we need to fetch name
-                        # For now, let's assume 'name' is directly available or use product_id
-                        # In a real app, you'd join with a products table to get names
-                        product_name = item.get("name", f"Product ID: {item.get('product_id', 'N/A')}")
+                        product_id = item.get("product_id", "N/A")
+                        product_info = product_names_map.get(product_id, {"name": f"Product ID: {product_id}", "price": 0.0}) # Get name and price
+                        product_name = product_info["name"]
+                        product_price = product_info["price"]
                         quantity = item.get("quantity", 1)
-                        cart_summary += f"- {product_name} x {quantity}\n"
+                        item_total = product_price * quantity
+                        cart_summary += f"- {product_name} x {quantity} (GHS {item_total:.2f})\n"
                     cart_summary += f"\n*Total: GHS {total_amount:.2f}*\n\n"
                     if pending_order.get("status") == "pending_confirmation":
                         cart_summary += "Please select *delivery* or *pickup* to proceed with your order."
