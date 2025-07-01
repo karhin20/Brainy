@@ -1,4 +1,3 @@
-# --- START OF FILE: index.py (FINAL HYBRID MODEL, FULLY INTEGRATED) ---
 
 import os
 import sys
