@@ -229,8 +229,14 @@ async def whatsapp_webhook(request: Request):
                 reply_message = "You don't have a pending order right now. Say 'menu' to start one!"
 
         elif intent == 'polite_acknowledgement':
-            # Check if the last message from the bot was an "end conversation" message
-            if last_bot_message == "Alright, have a great day! Feel free to message me anytime you need groceries.":
+            # Define known 'ending' bot messages
+            ending_messages = [
+                "Alright, have a great day! Feel free to message me anytime you need groceries.",
+                "You're welcome!" # This is the simple ack from the previous fix
+            ]
+            
+            # Check if the last message from the bot was one of the 'ending' messages
+            if last_bot_message in ending_messages:
                 reply_message = "You're welcome!" # Simple acknowledgement, no re-prompt
             else:
                 reply_message = "You're welcome! Is there anything else I can help with?"
