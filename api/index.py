@@ -204,7 +204,7 @@ async def confirm_items(request: OrderRequest):
     session_data = session_res.data[0]
     user_id, phone_number = session_data['user_id'], session_data['phone_number']
 
-    supabase.table("sessions").update({"session_token": None}).eq("user_id", user_id).execute()
+    supabase.table("sessions").delete().eq("session_token", request.session_token).execute()
 
     order_data = { "user_id": user_id, "items_json": [item for item in request.items], "total_amount": request.total_amount, "status": "pending_confirmation", "payment_status": "unpaid", "order_number": f"ORD-{int(datetime.now().timestamp())}", "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat() }
     order_res = supabase.table("orders").insert(order_data).execute()
