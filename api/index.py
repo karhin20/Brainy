@@ -1,5 +1,3 @@
-
-
 import os
 import sys
 import uuid
@@ -263,8 +261,6 @@ async def confirm_items(request: OrderRequest):
     product_details_map = {p["id"]: p for p in supabase.table("products").select("id, name").in_("id", product_ids).execute().data} if product_ids else {}
     
     ordered_items_list = [f'- {product_details_map.get(item["product_id"], {}).get("name", f"ID: {item.get("product_id")}")} x {item["quantity"]}' for item in request.items]
-
-    supabase.table("sessions").update({"session_token": None}).eq("user_id", user_id).execute()
 
     order_data = {"user_id": user_id, "items_json": [item for item in request.items], "total_amount": request.total_amount, "status": "pending_confirmation", "payment_status": "unpaid", "order_number": generate_order_number(), "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}
     order_res = supabase.table("orders").insert(order_data).execute()
