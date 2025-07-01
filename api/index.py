@@ -257,6 +257,10 @@ async def confirm_items(request: OrderRequest):
     if not session_res.data: raise HTTPException(404, "Session invalid")
     user_id, phone_number = session_res.data[0]['user_id'], session_res.data[0]['phone_number']
 
+    # Delete the session after it's been used to confirm an order.
+    # This replaces the line that was attempting to set session_token to None.
+    supabase.table("sessions").delete().eq("session_token", request.session_token).execute()
+
     product_ids = [item.get("product_id") for item in request.items if item.get("product_id")]
     product_details_map = {p["id"]: p for p in supabase.table("products").select("id, name").in_("id", product_ids).execute().data} if product_ids else {}
     
