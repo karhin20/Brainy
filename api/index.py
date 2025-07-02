@@ -483,6 +483,13 @@ async def whatsapp_webhook(request: Request):
                 reply_message = f"Of course. Please use the link below to complete your payment for order {order.get('order_number')}:\n\n{payment_link}"
             elif incoming_msg_body in ["cancel", "no"]:
                 supabase.table("orders").update({"status": ORDER_STATUS_CANCELLED}).eq("id", order['id']).execute()
+                # Also expire the session associated with this cancelled order
+                if current_session:
+                    try:
+                        supabase.table("sessions").update({"expires_at": datetime.now(timezone.utc).isoformat(), "last_intent": "order_cancelled", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", current_session['id']).execute()
+                        logger.debug(f"Session {current_session['id']} explicitly expired due to order cancellation.")
+                    except Exception as e:
+                        logger.error(f"Error expiring session {current_session['id']} after order cancellation: {e}", exc_info=True)
                 reply_message = f"Your order ({order.get('order_number')}) has been cancelled. Feel free to start a new one anytime!"
             else:
                 reply_message = f"You have a pending order ({order.get('order_number')}) awaiting payment. Would you like to *pay* now or *cancel* the order?"
@@ -665,3 +672,103 @@ async def confirm_items(request: OrderRequest):
 
 @app.get("/")
 async def root(): return {"message": "WhatsApp MarketBot Backend is running."}
+
+@app.post("/paystack-webhook")
+async def paystack_webhook(request: Request):
+    if not settings.PAYSTACK_SECRET_KEY:
+        logger.error("PAYSTACK_SECRET_KEY is not set. Cannot process Paystack webhook.")
+        raise HTTPException(status_code=500, detail="Server not configured for Paystack webhooks.")
+
+    body = await request.body()
+    signature = request.headers.get("x-paystack-signature")
+
+    if not signature:
+        logger.warning("Paystack webhook received without signature.")
+        raise HTTPException(status_code=400, detail="Missing X-Paystack-Signature header.")
+
+    # Verify webhook signature
+    import hmac
+    import hashlib
+    try:
+        hash_object = hmac.new(settings.PAYSTACK_SECRET_KEY.encode('utf-8'), body, hashlib.sha512)
+        expected_signature = hash_object.hexdigest()
+    except Exception as e:
+        logger.error(f"Error generating HMAC signature for Paystack webhook: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during signature verification.")
+
+    if not hmac.compare_digest(expected_signature, signature):
+        logger.warning(f"Invalid Paystack webhook signature. Received: {signature}, Expected: {expected_signature}")
+        raise HTTPException(status_code=400, detail="Invalid X-Paystack-Signature.")
+
+    event = json.loads(body)
+    logger.info(f"Received Paystack webhook event: {event.get('event')}")
+
+    if event.get("event") == "charge.success":
+        data = event.get("data", {})
+        reference = data.get("reference")
+        status = data.get("status")
+        amount = data.get("amount") # Amount in kobo/pesewas
+        currency = data.get("currency")
+        
+        logger.info(f"Paystack charge.success event received for reference: {reference}, status: {status}, amount: {amount/100:.2f} {currency}")
+
+        if status == "success":
+            # Extract order_id from metadata or reference
+            order_id = data.get("metadata", {}).get("order_id")
+            if not order_id and reference:
+                # Attempt to parse order_id from reference if it was constructed as "ORD-timestamp_unique"
+                try:
+                    # Assuming reference format is order_id_timestamp
+                    order_id = reference.split('_')[0]
+                except IndexError:
+                    logger.warning(f"Could not parse order_id from reference: {reference}")
+            
+            if not order_id:
+                logger.error(f"Paystack webhook: Could not determine order_id for successful transaction reference: {reference}. Event data: {event}")
+                return JSONResponse(content={"message": "Order ID not found in webhook data."}, status_code=400)
+
+            # Verify the transaction with Paystack (optional but recommended for critical updates)
+            # This step adds an extra layer of security.
+            verification_url = f"https://api.paystack.co/transaction/verify/{reference}"
+            headers = {"Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}"}
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    verify_res = await client.get(verification_url, headers=headers)
+                    verify_res.raise_for_status()
+                    verify_data = verify_res.json()
+                    
+                    if verify_data.get("status") is True and verify_data.get("data", {}).get("status") == "success":
+                        logger.info(f"Paystack transaction {reference} verified successfully.")
+                        # Update order status in Supabase
+                        try:
+                            order_update_res = supabase.table("orders").update({"payment_status": "paid", "status": ORDER_STATUS_PROCESSING, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
+                            if order_update_res.data:
+                                logger.info(f"Order {order_id} status updated to 'processing' (paid) after Paystack webhook.")
+                                # Get user phone to send confirmation
+                                user_res = supabase.table("users").select("phone_number").eq("id", order_update_res.data[0]['user_id']).single().execute()
+                                if user_res.data:
+                                    phone_number = user_res.data['phone_number']
+                                    await send_whatsapp_message(phone_number, f"🎉 Your payment for order {order_update_res.data[0].get('order_number', order_id)} has been confirmed! Your order is now processing.")
+                                    logger.info(f"Sent payment confirmation to user {phone_number} for order {order_id}.")
+                                else:
+                                    logger.error(f"Could not find user phone for order {order_id} to send payment confirmation.")
+                            else:
+                                logger.error(f"Failed to update order {order_id} in Supabase after successful Paystack webhook: {order_update_res.error}")
+                                # Even if Supabase update fails, return 200 to Paystack to avoid retries
+                        except Exception as db_e:
+                            logger.error(f"Database error updating order {order_id} after Paystack webhook: {db_e}", exc_info=True)
+                    else:
+                        logger.warning(f"Paystack transaction {reference} verification failed. Verify data: {verify_data}")
+                        # Optionally, handle failed verification (e.g., mark order as payment_failed, alert admin)
+            except httpx.RequestError as verify_e:
+                logger.error(f"Error verifying Paystack transaction {reference}: {verify_e}", exc_info=True)
+                # Still return 200 to Paystack to acknowledge receipt, but log internal error
+            except json.JSONDecodeError as json_e:
+                logger.error(f"JSON decode error from Paystack verification for reference {reference}: {json_e}", exc_info=True)
+                # Still return 200 to Paystack to acknowledge receipt, but log internal error
+        else:
+            logger.info(f"Paystack webhook received charge.success with status '{status}' for reference {reference}. No order update performed.")
+    
+    # Always return 200 OK to Paystack to acknowledge receipt of the webhook.
+    # Otherwise, Paystack will keep retrying the webhook.
+    return JSONResponse(content={"message": "Webhook received"}, status_code=200)
