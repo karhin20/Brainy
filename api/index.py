@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     PAYSTACK_PUBLIC_KEY: Optional[str] = None
     PAYSTACK_PAYMENT_URL: str = "https://api.paystack.co/transaction/initialize"
     API_KEY: str # Unused currently, consider removal if not needed
+    SESSION_ORDER_EXPIRY_HOURS: int = 1 # New: configurable expiry for web menu sessions
+    SESSION_HISTORY_EXPIRY_DAYS: int = 7 # New: configurable expiry for general history sessions
 
 settings = Settings()
 
@@ -86,7 +88,7 @@ if os.getenv("APP_ENV") == "production":
     logger.info(f"CORS set for PRODUCTION, allowing: {allowed_origins}")
 else:
     # For development, allow localhost, your Vercel URL, and potentially '*' for local testing ease
-    allowed_origins = ["*", "http://localhost:3000", settings.FRONTEND_URL]
+    allowed_origins = ["http://localhost:3000", settings.FRONTEND_URL]
     # Be cautious with '*' in development, but it's common for initial setup
     if os.getenv("ALLOW_ALL_CORS_DEV", "false").lower() == "true": # Use an env var to enable wider access in dev
         allowed_origins.append("*")
@@ -278,8 +280,9 @@ async def _send_bot_reply_and_update_session(
 
     # Update the user's last_bot_message in the users table
     try:
-        await supabase.table("users").update({"last_bot_message": reply_message[:1000]}).eq("id", user_id).execute()
-        logger.debug(f"Updated last_bot_message for user {user_id}.")
+        # Also update 'updated_at' for the user
+        await supabase.table("users").update({"last_bot_message": reply_message[:1000], "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", user_id).execute()
+        logger.debug(f"Updated last_bot_message and updated_at for user {user_id}.")
     except Exception as e:
         logger.error(f"Failed to update last_bot_message for user {user_id}: {e}", exc_info=True)
 
@@ -312,7 +315,7 @@ async def _send_bot_reply_and_update_session(
                 "user_id": user_id,
                 "phone_number": from_number_clean,
                 "session_token": new_session_token_for_history,
-                "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(), # Longer expiry for general history sessions
+                "expires_at": (datetime.now(timezone.utc) + timedelta(days=settings.SESSION_HISTORY_EXPIRY_DAYS)).isoformat(), # Use setting
                 "last_intent": intent if intent else "unstructured_conversation",
                 "conversation_history": json.dumps(current_conversation_history),
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -358,7 +361,7 @@ async def whatsapp_webhook(request: Request):
         user_res = supabase.table("users").select("id, last_bot_message").eq("phone_number", from_number_clean).limit(1).execute()
         is_new_user = not user_res.data
         if is_new_user:
-            insert_user_res = supabase.table("users").insert({"phone_number": from_number_clean}).execute()
+            insert_user_res = supabase.table("users").insert({"phone_number": from_number_clean, "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
             if insert_user_res.data:
                 user = insert_user_res.data[0]
                 logger.info(f"New user created: {user['id']}")
@@ -495,7 +498,7 @@ async def whatsapp_webhook(request: Request):
 
                 # Create a NEW session for the new order flow
                 new_session_token = str(uuid.uuid4())
-                expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat() # Session active for 1 hour for web menu
+                expires_at = (datetime.now(timezone.utc) + timedelta(hours=settings.SESSION_ORDER_EXPIRY_HOURS)).isoformat() # Use setting
                 session_payload = {
                     "user_id": user_id,
                     "phone_number": from_number_clean,
@@ -567,6 +570,12 @@ async def whatsapp_webhook(request: Request):
             elif intent == 'end_conversation':
                 reply_message = "Alright, have a great day! Feel free to message me anytime you need groceries."
             
+            elif intent == 'busy': # Handle specific AI intent for rate limits/busy
+                reply_message = "I'm a bit busy at the moment, please try again in a few minutes."
+
+            elif intent == 'error_ai': # Handle specific AI intent for AI errors
+                reply_message = "I seem to be having trouble understanding right now. Could you please rephrase, or type 'menu' to start an order?"
+            
             else: # greet or fallback
                 if is_new_user:
                     reply_message = "Hello and welcome to Fresh Market GH! 🌿 I'm your personal assistant for ordering fresh groceries. You can say 'menu' to start shopping, or 'status' to check an order."
@@ -615,9 +624,13 @@ async def confirm_items(request: OrderRequest):
     reply = (f"Thank you for confirming your items!\n\n*Your Order:*\n" + "\n".join(ordered_items_list) +
              f"\n\nSubtotal: *GHS {request.total_amount:.2f}*\n\nTo proceed, would you like *delivery* or will you *pickup* the order yourself?")
     
-    # Use the existing send_and_save_message for this specific scenario (confirm-items endpoint)
-    # as its behavior is slightly different from the webhook's continuous session updates.
-    await send_and_save_message(phone_number, reply, user_id)
+    # Use the centralized _send_bot_reply_and_update_session helper here
+    # Since this is initiated from the web, there might not be a 'current_session' from webhook logic
+    # but the helper will ensure a history session is created/updated for this interaction.
+    # We pass None for current_session, and the function will handle creating a new one if needed.
+    # We also pass the user's phone number and the reply as a "bot" message.
+    # The `user_id` is guaranteed to be available from the session lookup.
+    await _send_bot_reply_and_update_session(phone_number, reply, user_id, current_session=None, current_conversation_history=current_conversation_history, intent="order_confirmation_prompt")
     
     return {"status": "order_confirmed_on_whatsapp", "order_id": new_order_id}
 
