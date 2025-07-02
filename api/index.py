@@ -336,7 +336,7 @@ async def whatsapp_webhook(request: Request):
     from_number_clean = "unknown"
     reply_message = "" # Initialize reply_message early
     user_id: Optional[str] = None # Initialize user_id for broader scope, make optional
-    current_session: Optional[Dict[str, Any]] = None # To hold the active session dict
+    current_session: Optional[Dict[str, Any]] = None # To hold the currently active session (not expired)
     current_conversation_history: List[Dict[str, Any]] = [] # To build history
 
     try:
@@ -375,17 +375,19 @@ async def whatsapp_webhook(request: Request):
         last_bot_message = user.get('last_bot_message')
         logger.debug(f"Processing message for user {user_id} ({from_number_clean}).")
 
-        # 2. Find/Load Active Session for this user
+        # 2. Find/Load ANY Session for this user and determine if it's currently active
+        # This will be used to decide between UPDATE and INSERT for start_order intent
+        existing_session_record: Optional[Dict[str, Any]] = None
         session_res = supabase.table("sessions").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
         if session_res.data:
-            potential_session = session_res.data[0]
+            existing_session_record = session_res.data[0]
             try:
-                expires_at = datetime.fromisoformat(potential_session['expires_at'].replace('Z', '+00:00')) # Ensure timezone-aware
+                expires_at = datetime.fromisoformat(existing_session_record['expires_at'].replace('Z', '+00:00')) # Ensure timezone-aware
                 if datetime.now(timezone.utc) < expires_at:
-                    current_session = potential_session
+                    current_session = existing_session_record # This is the active one for conversation continuity
                     # Load existing conversation history
                     history_data = current_session.get('conversation_history')
-                    if history_data: # history can be string (JSONB) or already parsed list
+                    if history_data:
                         if isinstance(history_data, str):
                             try:
                                 current_conversation_history = json.loads(history_data)
@@ -397,9 +399,11 @@ async def whatsapp_webhook(request: Request):
                             current_conversation_history = history_data
                             logger.debug(f"Loaded existing conversation history as list for session {current_session['id']}.")
                 else:
-                    logger.debug(f"Expired session {potential_session['id']} found for user {user_id}. Not loading history.")
+                    logger.debug(f"Expired session {existing_session_record['id']} found for user {user_id}. Not loading history as active session.")
+                    # current_session remains None, which is correct for active history continuation
             except (ValueError, TypeError) as e:
-                logger.error(f"Error parsing session expires_at or history for user {user_id}, session {potential_session.get('id')}: {e}. Treating session as invalid.", exc_info=True)
+                logger.error(f"Error parsing session expires_at or history for user {user_id}, session {existing_session_record.get('id')}: {e}. Treating session as invalid.", exc_info=True)
+                # current_session remains None
 
         # 3. Add Incoming User Message to History
         user_message_entry: Dict[str, Any] = {
@@ -510,7 +514,7 @@ async def whatsapp_webhook(request: Request):
                 new_session_token = str(uuid.uuid4())
                 expires_at = (datetime.now(timezone.utc) + timedelta(hours=settings.SESSION_ORDER_EXPIRY_HOURS)).isoformat()
                 
-                session_update_or_insert_data = {
+                session_payload_data = {
                     "phone_number": from_number_clean,
                     "session_token": new_session_token,
                     "expires_at": expires_at,
@@ -519,27 +523,26 @@ async def whatsapp_webhook(request: Request):
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 }
 
-                # If a session record for this user already exists, update it
-                # The 'current_session' variable will be populated if any session exists for the user,
-                # even if it's already "expired" logically.
-                if current_session:
-                    logger.debug(f"User {user_id} starting new order. Updating existing session {current_session['id']}.")
-                    update_res = supabase.table("sessions").update(session_update_or_insert_data).eq("user_id", user_id).execute()
+                # If an existing session record for this user_id is found (active or expired), UPDATE it.
+                # Otherwise, INSERT a new one.
+                if existing_session_record: # Check if *any* record for user_id exists
+                    logger.debug(f"User {user_id} starting new order. Updating existing session record for user_id.")
+                    update_res = supabase.table("sessions").update(session_payload_data).eq("user_id", user_id).execute()
                     if update_res.data:
-                        current_session = update_res.data[0]
-                        logger.debug(f"Existing session {current_session['id']} updated for user {user_id}")
+                        current_session = update_res.data[0] # Update current_session to the newly updated one
+                        logger.debug(f"Existing session record for user {user_id} updated with new order session details.")
                     else:
-                        logger.error(f"Failed to update existing session for user {user_id} on start_order intent. Supabase response: {update_res.error}")
+                        logger.error(f"Failed to update existing session record for user {user_id} on start_order intent. Supabase response: {update_res.error}")
                         reply_message = "Sorry, I'm having trouble starting a new order right now. Please try again in a moment."
                         current_session = None # Ensure it's None if update failed
-                else: # No session record exists for this user, insert a new one
-                    logger.debug(f"No active session found for user {user_id}. Creating new session for start_order intent.")
-                    session_update_or_insert_data["user_id"] = user_id # Add user_id for insert
-                    session_update_or_insert_data["created_at"] = datetime.now(timezone.utc).isoformat() # Add created_at for insert
-                    insert_res = supabase.table("sessions").insert(session_update_or_insert_data).execute()
+                else: # No session record exists for this user_id, INSERT a new one
+                    logger.debug(f"No session record found for user {user_id}. Creating first session for start_order intent.")
+                    session_payload_data["user_id"] = user_id # Add user_id for insert
+                    session_payload_data["created_at"] = datetime.now(timezone.utc).isoformat() # Add created_at for insert
+                    insert_res = supabase.table("sessions").insert(session_payload_data).execute()
                     if insert_res.data:
                         current_session = insert_res.data[0]
-                        logger.debug(f"New session {current_session['id']} created for user {user_id}")
+                        logger.debug(f"New session {current_session['id']} created for user {user_id}.")
                     else:
                         logger.error(f"Failed to create new session for user {user_id} on start_order intent. Supabase response: {insert_res.error}")
                         reply_message = "Sorry, I'm having trouble starting a new order right now. Please try again in a moment."
