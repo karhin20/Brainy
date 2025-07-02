@@ -112,8 +112,56 @@ async def get_intent_with_context(user_message: str, last_bot_message: Optional[
 def generate_order_number(): return f"ORD-{int(datetime.now(timezone.utc).timestamp())}"
 def calculate_delivery_fee(lat: float, lon: float) -> float: return 15.00
 async def generate_paystack_payment_link(order_id: str, amount: float, user_phone: str) -> str:
-    if not settings.PAYSTACK_SECRET_KEY: return f"{settings.FRONTEND_URL}/payment-success?mock=true&order_id={order_id}"
-    return "https://paystack.com/pay/mock-payment-link" # Placeholder for functional code
+    if not settings.PAYSTACK_SECRET_KEY:
+        logger.warning("PAYSTACK_SECRET_KEY not set, cannot generate real payment link. Using mock link.")
+        return f"{settings.FRONTEND_URL}/payment-success?mock=true&order_id={order_id}"
+
+    headers = {
+        "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Paystack requires an email, construct a placeholder if only phone is available
+    placeholder_email = f"{''.join(filter(str.isdigit, user_phone))}@market.bot"
+    unique_reference = f"{order_id}_{int(datetime.now().timestamp())}"
+
+    payload = {
+        "email": placeholder_email,
+        "amount": int(amount * 100), # Amount in kobo/pesewas
+        "currency": "GHS", # Assuming Ghana Cedis
+        "reference": unique_reference,
+        "callback_url": f"{settings.FRONTEND_URL}/payment-success?order_id={order_id}",
+        "metadata": {"order_id": order_id, "phone": user_phone, "reference": unique_reference}
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(settings.PAYSTACK_PAYMENT_URL, headers=headers, json=payload)
+            response.raise_for_status() # Raise an exception for 4xx/5xx responses
+
+            data = response.json()
+            if data.get("status") is True and data.get("data") and data["data"].get("authorization_url"):
+                logger.info(f"Paystack payment link generated for order {order_id}: {data['data']['authorization_url']}")
+                return data["data"]["authorization_url"]
+            else:
+                logger.error(f"Paystack API returned success=true but missing authorization_url or unexpected data for order {order_id}: {data}")
+                raise ValueError("Paystack API response format error during link generation.")
+
+    except httpx.RequestError as e:
+        logger.error(f"Paystack API request error for order {order_id}: {e}", exc_info=True)
+        if isinstance(e, httpx.HTTPStatusError):
+            error_detail = e.response.text
+            try:
+                error_json = e.response.json()
+                error_detail = error_json.get('message', error_detail)
+            except json.JSONDecodeError:
+                pass
+            raise Exception(f"Payment gateway error ({e.response.status_code}): {error_detail}") from e
+        else:
+            raise Exception(f"Could not connect to payment gateway: {e}. Please check your internet connection.") from e
+    except Exception as e:
+        logger.error(f"Unexpected error during Paystack link generation for order {order_id}: {str(e)}", exc_info=True)
+        raise Exception(f"An unexpected error occurred during payment link generation.") from e
 
 async def send_and_save_message(phone: str, message: str, user_id: str):
     if not send_whatsapp_message_available or not supabase: return
@@ -229,14 +277,8 @@ async def whatsapp_webhook(request: Request):
                 reply_message = "You don't have a pending order right now. Say 'menu' to start one!"
 
         elif intent == 'polite_acknowledgement':
-            # Define known 'ending' bot messages
-            ending_messages = [
-                "Alright, have a great day! Feel free to message me anytime you need groceries.",
-                "You're welcome!" # This is the simple ack from the previous fix
-            ]
-            
-            # Check if the last message from the bot was one of the 'ending' messages
-            if last_bot_message in ending_messages:
+            # Check if the last message from the bot was an "end conversation" message
+            if last_bot_message == "Alright, have a great day! Feel free to message me anytime you need groceries.":
                 reply_message = "You're welcome!" # Simple acknowledgement, no re-prompt
             else:
                 reply_message = "You're welcome! Is there anything else I can help with?"
