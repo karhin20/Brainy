@@ -165,7 +165,7 @@ def calculate_delivery_fee(lat: float, lon: float) -> float:
     Currently a fixed value. THIS IS A KEY AREA FOR IMPROVEMENT
     to implement dynamic calculation (e.g., using a mapping API).
     """
-    return 15.00
+    return 0.01
 
 async def generate_paystack_payment_link(order_id: str, amount: float, user_phone: str) -> str:
     if not settings.PAYSTACK_SECRET_KEY:
