@@ -281,7 +281,7 @@ async def _send_bot_reply_and_update_session(
     # Update the user's last_bot_message in the users table
     try:
         # Also update 'updated_at' for the user
-        await supabase.table("users").update({"last_bot_message": reply_message[:1000], "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", user_id).execute()
+        supabase.table("users").update({"last_bot_message": reply_message[:1000], "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", user_id).execute()
         logger.debug(f"Updated last_bot_message and updated_at for user {user_id}.")
     except Exception as e:
         logger.error(f"Failed to update last_bot_message for user {user_id}: {e}", exc_info=True)
@@ -303,7 +303,7 @@ async def _send_bot_reply_and_update_session(
                 "last_intent": intent if intent else current_session.get("last_intent", "unknown"),
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
-            await supabase.table("sessions").update(update_data).eq("id", current_session['id']).execute()
+            supabase.table("sessions").update(update_data).eq("id", current_session['id']).execute()
             logger.debug(f"Updated existing session {current_session['id']} with new history and intent.")
         else:
             # Create a new session for this conversation if no active session was found/created by start_order
@@ -321,7 +321,7 @@ async def _send_bot_reply_and_update_session(
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
-            insert_res = await supabase.table("sessions").insert(insert_data).execute()
+            insert_res = supabase.table("sessions").insert(insert_data).execute()
             if insert_res.data:
                 logger.debug(f"New history session {insert_res.data[0]['id']} created for user {user_id}.")
             else:
@@ -493,7 +493,7 @@ async def whatsapp_webhook(request: Request):
                 # If there's an existing active session, expire it gracefully
                 if current_session:
                     logger.debug(f"User {user_id} starting new order, expiring current session {current_session['id']}.")
-                    await supabase.table("sessions").update({"expires_at": datetime.now(timezone.utc).isoformat(), "last_intent": "superseded_by_new_order", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", current_session['id']).execute()
+                    supabase.table("sessions").update({"expires_at": datetime.now(timezone.utc).isoformat(), "last_intent": "superseded_by_new_order", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", current_session['id']).execute()
                     current_session = None # Clear current_session as it's now expired/invalidated for new flow
 
                 # Create a NEW session for the new order flow
@@ -509,7 +509,7 @@ async def whatsapp_webhook(request: Request):
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 }
-                insert_session_res = await supabase.table("sessions").insert(session_payload).execute()
+                insert_session_res = supabase.table("sessions").insert(session_payload).execute()
                 if insert_session_res.data:
                     current_session = insert_session_res.data[0] # Set the new session as current
                     logger.debug(f"New session {current_session['id']} created for user {user_id}")
@@ -630,7 +630,27 @@ async def confirm_items(request: OrderRequest):
     # We pass None for current_session, and the function will handle creating a new one if needed.
     # We also pass the user's phone number and the reply as a "bot" message.
     # The `user_id` is guaranteed to be available from the session lookup.
-    await _send_bot_reply_and_update_session(phone_number, reply, user_id, current_session=None, current_conversation_history=current_conversation_history, intent="order_confirmation_prompt")
+    # We also explicitly create a user message entry for the 'confirm-items' trigger
+    # since this endpoint is external to the main whatsapp_webhook.
+    # First, append the "user" action that led to this endpoint call.
+    # Then, let _send_bot_reply_and_update_session handle the bot's reply.
+
+    # Simulate the user's action that led to /confirm-items
+    # This is a conceptual entry, as the actual user message came from the web, not WhatsApp.
+    # It helps to keep the conversation history coherent.
+    user_action_entry = {
+        "speaker": "user",
+        "message": f"Confirmed items on website (session: {request.session_token})",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": "web_action"
+    }
+    # Create a fresh history for this interaction, starting with the simulated user action
+    # This ensures that the conversation history for this specific web-initiated flow
+    # is tracked correctly, separate from any ongoing WhatsApp conversation session.
+    # The _send_bot_reply_and_update_session will then create a new session if needed.
+    web_initiated_history = [user_action_entry]
+
+    await _send_bot_reply_and_update_session(phone_number, reply, user_id, current_session=None, current_conversation_history=web_initiated_history, intent="order_confirmation_prompt")
     
     return {"status": "order_confirmed_on_whatsapp", "order_id": new_order_id}
 
