@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     PAYSTACK_SECRET_KEY: Optional[str] = None
     PAYSTACK_PUBLIC_KEY: Optional[str] = None
     PAYSTACK_PAYMENT_URL: str = "https://api.paystack.co/transaction/initialize"
-    API_KEY: str # Unused currently, consider removal if not needed
+    # API_KEY: str # Unused currently, consider removal if not needed
     SESSION_ORDER_EXPIRY_HOURS: int = 1 # New: configurable expiry for web menu sessions
     SESSION_HISTORY_EXPIRY_DAYS: int = 7 # New: configurable expiry for general history sessions
 
@@ -84,11 +84,11 @@ app = FastAPI(title="WhatsApp MarketBot API (State-First)", version="3.4.0")
 
 # --- CORS Configuration (Improved for Production) ---
 if os.getenv("APP_ENV") == "production":
-    allowed_origins = [settings.FRONTEND_URL]
+    allowed_origins = [settings.FRONTEND_URL, "https://preview--marketbot-command-center.lovable.app"]
     logger.info(f"CORS set for PRODUCTION, allowing: {allowed_origins}")
 else:
     # For development, allow localhost, your Vercel URL, and potentially '*' for local testing ease
-    allowed_origins = ["http://localhost:3000", settings.FRONTEND_URL]
+    allowed_origins = ["http://localhost:3000", settings.FRONTEND_URL, "https://preview--marketbot-command-center.lovable.app"]
     # Be cautious with '*' in development, but it's common for initial setup
     if os.getenv("ALLOW_ALL_CORS_DEV", "false").lower() == "true": # Use an env var to enable wider access in dev
         allowed_origins.append("*")
@@ -143,7 +143,7 @@ async def get_intent_with_context(user_message: str, last_bot_message: Optional[
         if e.response.status_code == 429: # Too Many Requests
             return {"intent": "busy"} # Custom intent or message to user
         elif e.response.status_code == 400: # Bad Request, often from prompt issues or invalid key
-             return {"intent": "error_ai"}
+            return {"intent": "error_ai"}
         return {"intent": "greet"} # Fallback to greet on general HTTP errors
     except httpx.RequestError as e:
         logger.error(f"Gemini API Network/Request Error for user message '{user_message}': {e}", exc_info=True)
@@ -350,7 +350,7 @@ async def whatsapp_webhook(request: Request):
             return JSONResponse(content={}, status_code=200)
 
         from_number_clean = from_number.replace("whatsapp:", "")
-        
+
         if not supabase:
             logger.error(f"SUPABASE CHECK (WHATSAPP_WEBHOOK): Supabase client NOT available. Cannot process message from {from_number_clean}.")
             # user_id is not available here, so pass None
@@ -424,6 +424,16 @@ async def whatsapp_webhook(request: Request):
 
         # --- STATE-FIRST LOGIC (HIGHEST PRIORITY) ---
         handled_by_state = False
+
+        # Check if there's an active session related to starting an order
+        # and if the user's message is a new attempt to order (e.g., "I want mango")
+        if current_session and current_session.get("last_intent") == "start_order":
+            # If the user is trying to order directly from chat again, remind them about the link
+            menu_url = f"{settings.FRONTEND_URL}?session={current_session['session_token']}"
+            reply_message = f"Please select your items from our online menu using this link: {menu_url}\n\nOnce you've confirmed your items on the website, return to this chat!"
+            await _send_bot_reply_and_update_session(from_number_clean, reply_message, user_id, current_session, current_conversation_history, "remind_menu_link")
+            handled_by_state = True
+            return JSONResponse(content={}, status_code=200)
 
         # 1. Check for an order awaiting delivery/pickup choice
         pending_confirm_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", ORDER_STATUS_PENDING_CONFIRMATION).order("created_at", desc=True).limit(1).execute()
@@ -629,7 +639,6 @@ async def confirm_items(request: OrderRequest):
     # but the helper will ensure a history session is created/updated for this interaction.
     # We pass None for current_session, and the function will handle creating a new one if needed.
     # We also pass the user's phone number and the reply as a "bot" message.
-    # The `user_id` is guaranteed to be available from the session lookup.
     # We also explicitly create a user message entry for the 'confirm-items' trigger
     # since this endpoint is external to the main whatsapp_webhook.
     # First, append the "user" action that led to this endpoint call.
