@@ -1,3 +1,4 @@
+language: Brains/api/index.py
 import os
 import sys
 import uuid
@@ -165,12 +166,12 @@ def calculate_delivery_fee(lat: float, lon: float) -> float:
     Currently a fixed value. THIS IS A KEY AREA FOR IMPROVEMENT
     to implement dynamic calculation (e.g., using a mapping API).
     """
-    return 0.01
+    return 15.00
 
-async def generate_paystack_payment_link(order_id: str, amount: float, user_phone: str) -> str:
+async def generate_paystack_payment_link(order_id: str, order_number: str, amount: float, user_phone: str) -> str:
     if not settings.PAYSTACK_SECRET_KEY:
         logger.warning("PAYSTACK_SECRET_KEY not set, cannot generate real payment link. Using mock link.")
-        return f"{settings.FRONTEND_URL}/payment-success?mock=true&order_id={order_id}"
+        return f"{settings.FRONTEND_URL}/payment-success?mock=true&order_number={order_number}"
 
     headers = {
         "Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}",
@@ -186,7 +187,7 @@ async def generate_paystack_payment_link(order_id: str, amount: float, user_phon
         "amount": int(amount * 100), # Amount in kobo/pesewas
         "currency": "GHS", # Assuming Ghana Cedis
         "reference": unique_reference,
-        "callback_url": f"{settings.FRONTEND_URL}/payment-success?order_id={order_id}",
+        "callback_url": f"{settings.FRONTEND_URL}/payment-success?order_number={order_number}",
         "metadata": {"order_id": order_id, "phone": user_phone, "reference": unique_reference}
     }
 
@@ -306,9 +307,11 @@ async def _send_bot_reply_and_update_session(
             supabase.table("sessions").update(update_data).eq("id", current_session['id']).execute()
             logger.debug(f"Updated existing session {current_session['id']} with new history and intent.")
         else:
-            # Create a new session for this conversation if no active session was found/created by start_order
-            # This handles cases like 'greet', 'check_status' if no ordering session is active,
-            # ensuring conversation history is still captured.
+            # This 'else' block will only be hit if, for some reason, current_session is None
+            # even though existing_session_record might exist (e.g., if existing_session_record
+            # was expired and thus not assigned to current_session).
+            # With the current logic, existing_session_record is handled explicitly in start_order.
+            # This part is primarily for general conversation history tracking outside of specific states.
             logger.debug(f"No active session found. Creating new session for user {user_id} to store history.")
             new_session_token_for_history = str(uuid.uuid4())
             insert_data = {
@@ -443,12 +446,14 @@ async def whatsapp_webhook(request: Request):
         pending_confirm_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", ORDER_STATUS_PENDING_CONFIRMATION).order("created_at", desc=True).limit(1).execute()
         if pending_confirm_res.data:
             order = pending_confirm_res.data[0]
-            if "delivery" in incoming_msg_body:
+            # Convert incoming_msg_body to lowercase for case-insensitive matching
+            lower_incoming_msg_body = incoming_msg_body.lower()
+            if "delivery" in lower_incoming_msg_body:
                 supabase.table("orders").update({"status": ORDER_STATUS_AWAITING_LOCATION}).eq("id", order['id']).execute()
                 reply_message = "Great! To calculate the delivery fee, please share your location using the WhatsApp location feature.\n\nTap the *clip icon 📎*, then choose *'Location' 📍*."
-            elif "pickup" in incoming_msg_body:
+            elif "pickup" in lower_incoming_msg_body:
                 supabase.table("orders").update({"status": ORDER_STATUS_PENDING_PAYMENT, "delivery_type": "pickup"}).eq("id", order['id']).execute()
-                payment_link = await generate_paystack_payment_link(order['id'], order['total_amount'], from_number_clean)
+                payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], order['total_amount'], from_number_clean)
                 reply_message = f"Alright, your order is set for pickup. Your total is *GHS {order['total_amount']:.2f}*. Please complete your payment here:\n\n{payment_link}"
             else:
                 reply_message = f"You have an order pending confirmation. Please choose how you'd like to receive your order: *delivery* or *pickup*?"
@@ -469,7 +474,7 @@ async def whatsapp_webhook(request: Request):
             update_data = {"status": ORDER_STATUS_PENDING_PAYMENT, "delivery_fee": delivery_fee, "total_with_delivery": total_with_delivery, "delivery_location_lat": lat, "delivery_location_lon": lon}
             supabase.table("orders").update(update_data).eq("id", order['id']).execute()
             
-            payment_link = await generate_paystack_payment_link(order['id'], total_with_delivery, from_number_clean)
+            payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], total_with_delivery, from_number_clean)
             reply_message = f"Thank you! Your delivery fee is GHS {delivery_fee:.2f}. Your new total is *GHS {total_with_delivery:.2f}*.\n\nPlease use this link to pay:\n{payment_link}"
             
             # Call centralized helper
@@ -483,7 +488,7 @@ async def whatsapp_webhook(request: Request):
             order = unpaid_order_res.data[0]
             if incoming_msg_body in ["pay", "yes", "payment"]:
                 total = order.get('total_with_delivery') or order.get('total_amount', 0)
-                payment_link = await generate_paystack_payment_link(order['id'], total, from_number_clean)
+                payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], total, from_number_clean)
                 reply_message = f"Of course. Please use the link below to complete your payment for order {order.get('order_number')}:\n\n{payment_link}"
             elif incoming_msg_body in ["cancel", "no"]:
                 supabase.table("orders").update({"status": ORDER_STATUS_CANCELLED}).eq("id", order['id']).execute()
