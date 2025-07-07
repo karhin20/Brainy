@@ -6,6 +6,8 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Literal
+import random
+import pytz # Added: For time zone handling
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Security, status
 from fastapi.responses import JSONResponse
@@ -112,15 +114,28 @@ async def get_intent_with_context(user_message: str, last_bot_message: Optional[
     if not settings.GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY not set. Using keyword-based intent detection fallback.")
         lower_msg = user_message.lower()
-        if any(word in lower_msg for word in ["buy", "menu", "order food"]): return {"intent": "start_order"}
-        if any(word in lower_msg for word in ["status", "where is my order", "order update"]): return {"intent": "check_status"}
-        if any(word in lower_msg for word in ["no", "good", "moment", "all", "nothing else"]): return {"intent": "end_conversation"}
-        if any(word in lower_msg for word in ["thank", "ok", "got it", "thanks"]): return {"intent": "polite_acknowledgement"}
-        if any(word in lower_msg for word in ["cart", "items", "my order", "my items", "what have i selected"]): return {"intent": "show_cart"}
-        return {"intent": "greet"}
+        
+        # Explicitly check for greetings first
+        if any(word in lower_msg for word in ["hello", "hi", "hey", "sup", "good morning", "good afternoon", "good evening"]):
+            return {"intent": "greet"}
+        
+        # New: Explicitly check for help command
+        if any(word in lower_msg for word in ["help", "assist", "support", "what can you do"]):
+            return {"intent": "help"}
+
+        # Expanded keywords for better fallback matching
+        if any(word in lower_msg for word in ["buy", "menu", "order food", "shop", "browse", "start new order"]): return {"intent": "start_order"}
+        if any(word in lower_msg for word in ["status", "where is my order", "order update", "my order status", "track order"]): return {"intent": "check_status"}
+        if any(word in lower_msg for word in ["no", "good", "moment", "all", "nothing else", "i'm done", "that's all", "bye"]): return {"intent": "end_conversation"}
+        if any(word in lower_msg for word in ["thank", "ok", "got it", "thanks", "alright", "cool"]): return {"intent": "polite_acknowledgement"}
+        if any(word in lower_msg for word in ["cart", "items", "my order", "my items", "what have i selected", "basket", "my selection", "what's in my cart"]): return {"intent": "show_cart"}
+        
+        # Fallback to a new 'unknown_input' intent if none of the above specific keywords are matched
+        return {"intent": "unknown_input"} # Changed from 'greet' to 'unknown_input'
 
     prompt = f"""
     Analyze the user's message for a grocery bot based on the context of the bot's last message. Respond ONLY with a single, minified JSON object.
+    You MUST choose one of the specified intents and NEVER invent your own. If unsure, default to 'unknown_input'.
     CONTEXT: The bot's last message to the user was: "{last_bot_message or 'No previous message.'}"
     User's New Message: "{user_message}"
     Your JSON output MUST contain one key, "intent", with one of these values:
@@ -130,30 +145,38 @@ async def get_intent_with_context(user_message: str, last_bot_message: Optional[
     - `polite_acknowledgement`: User is saying "thanks", "ok", "got it".
     - `end_conversation`: User is clearly ending the conversation (e.g., "no thanks", "I am good", "that's all").
     - `greet`: A general greeting or question.
+    - `help`: User is asking for help or what the bot can do.
+    - `unknown_input`: The user's intent is unclear or not covered by other categories. This is the default if no clear intent is found.
     """
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             res = await client.post(settings.GEMINI_API_URL, headers={"Content-Type": "application/json"}, params={"key": settings.GEMINI_API_KEY}, json=payload)
             res.raise_for_status()
-            return json.loads(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+            ai_response = json.loads(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+            # Ensure the AI actually returned a valid intent from our list
+            valid_intents = ["start_order", "check_status", "show_cart", "polite_acknowledgement", "end_conversation", "greet", "help", "unknown_input"]
+            if ai_response.get("intent") in valid_intents:
+                return ai_response
+            else:
+                logger.warning(f"AI returned invalid intent '{ai_response.get('intent')}'. Defaulting to unknown_input.")
+                return {"intent": "unknown_input"}
     except httpx.HTTPStatusError as e:
         logger.error(f"Gemini API HTTP Error ({e.response.status_code}) for user message '{user_message}': {e.response.text}", exc_info=True)
-        # Specific handling for rate limits or invalid keys could go here
-        if e.response.status_code == 429: # Too Many Requests
-            return {"intent": "busy"} # Custom intent or message to user
-        elif e.response.status_code == 400: # Bad Request, often from prompt issues or invalid key
+        if e.response.status_code == 429:
+            return {"intent": "busy"}
+        elif e.response.status_code == 400:
             return {"intent": "error_ai"}
-        return {"intent": "greet"} # Fallback to greet on general HTTP errors
+        return {"intent": "unknown_input"} # Fallback for general HTTP errors
     except httpx.RequestError as e:
         logger.error(f"Gemini API Network/Request Error for user message '{user_message}': {e}", exc_info=True)
-        return {"intent": "greet"} # Fallback if network issue (DNS, connection, timeout)
+        return {"intent": "unknown_input"} # Fallback if network issue
     except json.JSONDecodeError as e:
         logger.error(f"Gemini API Response JSON Decode Error for user message '{user_message}': {e}", exc_info=True)
-        return {"intent": "greet"} # Fallback if response isn't valid JSON
+        return {"intent": "unknown_input"} # Fallback if response isn't valid JSON
     except Exception as e:
         logger.error(f"Unexpected error in get_intent_with_context for user message '{user_message}': {e}", exc_info=True)
-        return {"intent": "greet"}
+        return {"intent": "unknown_input"} # Fallback for any other unexpected errors
 
 
 # --- HELPER FUNCTIONS ---
@@ -332,6 +355,169 @@ async def _send_bot_reply_and_update_session(
         logger.error(f"Failed to update or create session for user {user_id}: {e}", exc_info=True)
 
 
+# --- Constants for Varied Bot Responses ---
+GREETING_NEW_USER_RESPONSES = [
+    "Hello and welcome to Fresh Market GH! 🌿 I'm your personal assistant for ordering fresh groceries. You can say 'menu' to start shopping, or 'status' to check an order.",
+    "Hi there! Welcome to Fresh Market GH! I'm here to help you with your groceries. Just say 'menu' to see what's available, or 'status' to check on an existing order.",
+    "Greetings from Fresh Market GH! I'm your virtual grocery assistant. To begin shopping, simply type 'menu'. If you have an order, you can ask for its 'status'.",
+    "A warm welcome to Fresh Market GH! I'm your go-to for fresh groceries. Ready to explore the 'menu' or check your order 'status'?",
+    "Fresh Market GH at your service! I can help you order groceries. Start by typing 'menu' or inquire about your 'status'."
+]
+
+GREETING_RETURNING_USER_RESPONSES = [
+    "Welcome back! How can I help with your groceries today? (You can say 'menu' or 'status')",
+    "Good to see you again! What can I assist you with today regarding your groceries? (Try 'menu' or 'status')",
+    "Hey there! Ready for more fresh groceries? Let me know if you want to see the 'menu' or check your 'status'.",
+    "Nice to have you back! What's on your grocery list today? 'Menu' or 'status'?",
+    "Hello again! How can I assist you with your Fresh Market GH order? 'Menu' or 'status'?"
+]
+
+# Time-based greetings
+GREETING_MORNING_RESPONSES = [
+    "Good morning! How can I help you with your groceries today? (Say 'menu' or 'status')",
+    "Good morning! Ready to start your day with fresh groceries? (Type 'menu' or 'status')",
+    "Rise and shine! Fresh Market GH is here. What can I do for you this morning? ('menu' or 'status')"
+]
+
+GREETING_AFTERNOON_RESPONSES = [
+    "Good afternoon! How may I assist you with your grocery needs? ('menu' or 'status')",
+    "Good afternoon! Looking for fresh groceries? Just say 'menu' or 'status'.",
+    "Hello this afternoon! How can I help you with your order? ('menu' or 'status')"
+]
+
+GREETING_EVENING_RESPONSES = [
+    "Good evening! What can I help you with before the day ends? ('menu' or 'status')",
+    "Good evening! Ready for your dinner groceries? Just type 'menu' or 'status'.",
+    "Hello this evening! How can I make your grocery shopping easier? ('menu' or 'status')"
+]
+
+MENU_LINK_REMINDERS = [
+    "Please select your items from our online menu using this link: {menu_url}\n\nOnce you've confirmed your items on the website, return to this chat!",
+    "Your cart is ready on the web menu! Use this link to continue: {menu_url}\n\nRemember to come back here after confirming your choices!",
+    "Just a friendly reminder to complete your order through our menu link: {menu_url}\n\nLet me know when you're done there!",
+    "To pick your items, click here: {menu_url}\n\nDon't forget to come back to WhatsApp to confirm your order once you've made your selections!",
+    "Ready to browse? Here's your personalized menu link: {menu_url}\n\nOnce you've added everything, just head back to our chat."
+]
+
+DELIVERY_PICKUP_PROMPTS = [
+    "You have an order pending confirmation. Please choose how you'd like to receive your order: *delivery* or *pickup*?",
+    "Your order is awaiting your decision: *delivery* or *pickup*? Please let me know your preference.",
+    "How would you like to get your order? Reply with *delivery* or *pickup*.",
+    "To proceed with your order, tell me: *delivery* or *pickup*?",
+    "Are you opting for *delivery* or *pickup* for your current order?"
+]
+
+LOCATION_REQUEST_PROMPTS = [
+    "Great! To calculate the delivery fee, please share your location using the WhatsApp location feature.\n\nTap the *clip icon 📎*, then choose *'Location' 📍*.",
+    "Alright! I'll need your location to figure out the delivery charge. Could you please share it via WhatsApp's location feature? (It's under the *clip icon 📎*).",
+    "Perfect! To finalize delivery, please send me your location. Just hit the *clip icon 📎* and select 'Location' 📍.",
+    "For delivery, I need your location! Please use the 'Location' feature (the *clip icon 📎*) in WhatsApp.",
+    "Kindly share your location so I can calculate delivery. Find the 'Location' option under the *clip icon 📎*."
+]
+
+PAYMENT_LINK_REMINDERS = [
+    "Of course. Please use the link below to complete your payment for order {order_number}:\n\n{payment_link}",
+    "Here's your payment link for order {order_number}. Please complete the transaction to finalize your order: {payment_link}",
+    "Ready to pay for order {order_number}? Use this secure link: {payment_link}",
+    "To complete order {order_number}, simply click on this payment link: {payment_link}",
+    "Your payment link for {order_number} is ready: {payment_link}\n\nPlease proceed with the payment."
+]
+
+ORDER_CANCELLED_CONFIRMATIONS = [
+    "Your order ({order_number}) has been cancelled. Feel free to start a new one anytime!",
+    "Order {order_number} has been successfully cancelled. You can begin a fresh order whenever you like!",
+    "Confirmed: Order {order_number} is no longer active. Let me know if you change your mind and want to order again!",
+    "The cancellation for order {order_number} is complete. Feel free to browse our menu again!",
+    "We've cancelled order {order_number} for you. Just say 'menu' to start fresh!"
+]
+
+PENDING_PAYMENT_PROMPTS = [
+    "You have a pending order ({order_number}) awaiting payment. Would you like to *pay* now or *cancel* the order?",
+    "Order {order_number} is waiting for payment. Should I send the payment link again, or would you like to *cancel*?",
+    "Your order {order_number} needs payment. Please *pay* or *cancel*.",
+    "Just a reminder for order {order_number}: it's awaiting payment. *Pay* or *cancel*?",
+    "Action needed for order {order_number}: complete your *payment* or *cancel*."
+]
+
+CART_EMPTY_RESPONSES = [
+    "Your cart is currently empty. To start an order, just say 'menu'.",
+    "Nothing in your cart right now! Type 'menu' to start adding items.",
+    "It looks like your cart is empty. How about we start a new order? Just say 'menu'!",
+    "Your shopping cart is empty. Would you like to view our 'menu' and fill it up?",
+    "No items in your cart. Time to go shopping! Just type 'menu'."
+]
+
+POLITE_ACKNOWLEDGEMENT_RESPONSES_GENERAL = [
+    "You're welcome! Is there anything else I can help with?",
+    "No problem at all! Anything else I can assist you with today?",
+    "My pleasure! Let me know if you need anything else.",
+    "Glad to help! Do you have any other questions or needs?",
+    "You got it! What else can I do for you?"
+]
+
+POLITE_ACKNOWLEDGEMENT_RESPONSES_ENDING = [
+    "Alright, have a great day! Feel free to message me anytime you need groceries.",
+    "You're welcome!", # Sometimes a simple 'You're welcome!' is best
+    "Glad I could help! Enjoy the rest of your day.",
+    "Perfect! Have a wonderful day, and I'm here if you need me.",
+    "You're all set! Take care and don't hesitate to reach out."
+]
+
+END_CONVERSATION_RESPONSES = [
+    "Alright, have a great day! Feel free to message me anytime you need groceries.",
+    "Understood! Have a wonderful day. Don't hesitate to reach out if you need anything.",
+    "Goodbye! Looking forward to helping you with your next order.",
+    "Farewell! Take care, and I'll be here for your next grocery run.",
+    "Okay, chat soon! Wishing you a great day."
+]
+
+AI_BUSY_RESPONSES = [
+    "I'm a bit busy at the moment, please try again in a few minutes.",
+    "My systems are a little overloaded right now. Could you please wait a moment and try again?",
+    "Apologies, I'm experiencing high traffic. Please retry your request shortly.",
+    "Currently facing heavy load, please bear with me and try again in a bit.",
+    "I'm a bit tied up. Can you give me a few moments and try your request again?"
+]
+
+AI_ERROR_RESPONSES = [
+    "I seem to be having trouble understanding right now. Could you please rephrase, or type 'menu' to start an order?",
+    "My apologies, I'm having a little difficulty processing your request. Could you phrase it differently, or type 'menu'?",
+    "I'm sorry, I didn't quite get that. Perhaps try rephrasing, or simply say 'menu' to begin an order.",
+    "Something went wrong on my end. Please try rephrasing your message, or type 'menu' to get started.",
+    "I'm experiencing a temporary glitch. Please try your message again, or use 'menu' to see our products."
+]
+
+# New: Help Responses
+HELP_RESPONSES = [
+    "I can help you order groceries, check your order status, or show your cart. Just type 'menu', 'status', 'cart', or 'cancel'.",
+    "Need assistance? I can guide you through ordering by saying 'menu', check your 'status', or show your 'cart'.",
+    "How can I assist you? You can say 'menu' to start an order, 'status' to check an existing one, or 'cart' to review your items, or 'cancel' an order."
+]
+
+UNKNOWN_INPUT_RESPONSES = [
+    "I'm not sure I understand. Could you try rephrasing your request, or type 'menu' to start an order?",
+    "Hmm, I didn't quite get that. Try asking in a different way, or say 'menu' to see our products.",
+    "I'm still learning! Could you simplify your request, or type 'menu' to browse?",
+    "Apologies, I'm having trouble understanding. Maybe try 'menu' or 'status' to get started."
+]
+
+# --- HELPER FUNCTIONS ---
+def get_time_of_day_greeting():
+    """
+    Returns a time-based greeting based on the current GMT time.
+    """
+    gmt_tz = pytz.timezone('GMT')
+    current_gmt_time = datetime.now(gmt_tz).time()
+
+    if current_gmt_time >= datetime.strptime('05:00', '%H:%M').time() and \
+       current_gmt_time < datetime.strptime('12:00', '%H:%M').time():
+        return random.choice(GREETING_MORNING_RESPONSES)
+    elif current_gmt_time >= datetime.strptime('12:00', '%H:%M').time() and \
+         current_gmt_time < datetime.strptime('17:00', '%H:%M').time():
+        return random.choice(GREETING_AFTERNOON_RESPONSES)
+    else:
+        return random.choice(GREETING_EVENING_RESPONSES)
+
 # --- PRIMARY WEBHOOK (STATE-FIRST ARCHITECTURE) ---
 @app.post("/whatsapp-webhook")
 async def whatsapp_webhook(request: Request):
@@ -354,31 +540,35 @@ async def whatsapp_webhook(request: Request):
         from_number_clean = from_number.replace("whatsapp:", "")
 
         if not supabase:
-            logger.error(f"SUPABASE CHECK (WHATSAPP_WEBHOOK): Supabase client NOT available. Cannot process message from {from_number_clean}.")
-            # user_id is not available here, so pass None
-            await send_user_error_message(from_number_clean, None, "Sorry, I'm currently experiencing technical difficulties. Please try again later.")
-            return JSONResponse(content={"detail": "Database unavailable"}, status_code=200)
+            logger.critical(f"SUPABASE_UNAVAILABLE: Supabase client NOT initialized. Cannot process message from {from_number_clean}.")
+            await send_user_error_message(from_number_clean, None, "I'm sorry, I'm experiencing a temporary technical issue. Please try again in a few moments.")
+            return JSONResponse(content={"detail": "Database unavailable"}, status_code=200) # Still 200 for Twilio to not retry
 
         # 1. Find or Create User
-        user_res = supabase.table("users").select("id, last_bot_message").eq("phone_number", from_number_clean).limit(1).execute()
-        is_new_user = not user_res.data
-        if is_new_user:
-            insert_user_res = supabase.table("users").insert({"phone_number": from_number_clean, "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
-            if insert_user_res.data:
-                user = insert_user_res.data[0]
-                logger.info(f"New user created: {user['id']}")
+        try:
+            user_res = supabase.table("users").select("id, last_bot_message").eq("phone_number", from_number_clean).limit(1).execute()
+            is_new_user = not user_res.data
+            if is_new_user:
+                insert_user_res = supabase.table("users").insert({"phone_number": from_number_clean, "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
+                if insert_user_res.data:
+                    user = insert_user_res.data[0]
+                    logger.info(f"New user created: {user['id']}")
+                else:
+                    logger.error(f"Failed to create new user {from_number_clean}: {insert_user_res.error}")
+                    await send_user_error_message(from_number_clean, None, "I couldn't register your number. Please try sending a message again.")
+                    return JSONResponse(content={}, status_code=200)
             else:
-                logger.error(f"Failed to create new user {from_number_clean}: {insert_user_res.error}")
-                await send_user_error_message(from_number_clean, None, "Failed to register you. Please try again.")
-                return JSONResponse(content={}, status_code=200)
-        else:
-            user = user_res.data[0]
-        user_id = user['id']
+                user = user_res.data[0]
+        except Exception as db_op_e:
+            logger.error(f"Database operation failed for user lookup/creation ({from_number_clean}): {db_op_e}", exc_info=True)
+            await send_user_error_message(from_number_clean, None, "I'm having trouble accessing my records right now. Please try again shortly.")
+            return JSONResponse(content={}, status_code=200)
+        
+        user_id = user['id'] # Set user_id here as it's now guaranteed
         last_bot_message = user.get('last_bot_message')
         logger.debug(f"Processing message for user {user_id} ({from_number_clean}).")
 
         # 2. Find/Load ANY Session for this user and determine if it's currently active
-        # This will be used to decide between UPDATE and INSERT for start_order intent
         existing_session_record: Optional[Dict[str, Any]] = None
         session_res = supabase.table("sessions").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
         if session_res.data:
@@ -402,10 +592,8 @@ async def whatsapp_webhook(request: Request):
                             logger.debug(f"Loaded existing conversation history as list for session {current_session['id']}.")
                 else:
                     logger.debug(f"Expired session {existing_session_record['id']} found for user {user_id}. Not loading history as active session.")
-                    # current_session remains None, which is correct for active history continuation
             except (ValueError, TypeError) as e:
                 logger.error(f"Error parsing session expires_at or history for user {user_id}, session {existing_session_record.get('id')}: {e}. Treating session as invalid.", exc_info=True)
-                # current_session remains None
 
         # 3. Add Incoming User Message to History
         user_message_entry: Dict[str, Any] = {
@@ -420,23 +608,22 @@ async def whatsapp_webhook(request: Request):
             user_message_entry["message"] = f"Shared location: {lat},{lon}"
             user_message_entry["type"] = "location"
         else:
-            # Handle cases where message body is empty but it's not a location (e.g., media messages without text)
             user_message_entry["message"] = f"Received message of type: {form_data.get('MessageType', 'unknown')} (no text/location)"
             user_message_entry["type"] = form_data.get('MessageType', 'unknown')
         
         current_conversation_history.append(user_message_entry)
         logger.debug(f"Appended user message to history. Current history length: {len(current_conversation_history)}")
 
-
         # --- STATE-FIRST LOGIC (HIGHEST PRIORITY) ---
         handled_by_state = False
+        negation_keywords = ["not", "don't", "dont", "no"] # Defined here for convenience
 
         # Check if there's an active session related to starting an order
         # and if the user's message is a new attempt to order (e.g., "I want mango")
         if current_session and current_session.get("last_intent") == "start_order":
             # If the user is trying to order directly from chat again, remind them about the link
             menu_url = f"{settings.FRONTEND_URL}?session={current_session['session_token']}"
-            reply_message = f"Please select your items from our online menu using this link: {menu_url}\n\nOnce you've confirmed your items on the website, return to this chat!"
+            reply_message = random.choice(MENU_LINK_REMINDERS).format(menu_url=menu_url)
             await _send_bot_reply_and_update_session(from_number_clean, reply_message, user_id, current_session, current_conversation_history, "remind_menu_link")
             handled_by_state = True
             return JSONResponse(content={}, status_code=200)
@@ -445,19 +632,18 @@ async def whatsapp_webhook(request: Request):
         pending_confirm_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", ORDER_STATUS_PENDING_CONFIRMATION).order("created_at", desc=True).limit(1).execute()
         if pending_confirm_res.data:
             order = pending_confirm_res.data[0]
-            # Convert incoming_msg_body to lowercase for case-insensitive matching
             lower_incoming_msg_body = incoming_msg_body.lower()
-            if "delivery" in lower_incoming_msg_body:
+            
+            if "delivery" in lower_incoming_msg_body and not any(neg in lower_incoming_msg_body for neg in negation_keywords):
                 supabase.table("orders").update({"status": ORDER_STATUS_AWAITING_LOCATION}).eq("id", order['id']).execute()
-                reply_message = "Great! To calculate the delivery fee, please share your location using the WhatsApp location feature.\n\nTap the *clip icon 📎*, then choose *'Location' 📍*."
-            elif "pickup" in lower_incoming_msg_body:
+                reply_message = random.choice(LOCATION_REQUEST_PROMPTS)
+            elif "pickup" in lower_incoming_msg_body and not any(neg in lower_incoming_msg_body for neg in negation_keywords):
                 supabase.table("orders").update({"status": ORDER_STATUS_PENDING_PAYMENT, "delivery_type": "pickup"}).eq("id", order['id']).execute()
                 payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], order['total_amount'], from_number_clean)
                 reply_message = f"Alright, your order is set for pickup. Your total is *GHS {order['total_amount']:.2f}*. Please complete your payment here:\n\n{payment_link}"
             else:
-                reply_message = f"You have an order pending confirmation. Please choose how you'd like to receive your order: *delivery* or *pickup*?"
+                reply_message = random.choice(DELIVERY_PICKUP_PROMPTS)
             
-            # Call centralized helper
             await _send_bot_reply_and_update_session(from_number_clean, reply_message, user_id, current_session, current_conversation_history, "delivery_or_pickup_prompt")
             handled_by_state = True
             return JSONResponse(content={}, status_code=200)
@@ -476,7 +662,6 @@ async def whatsapp_webhook(request: Request):
             payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], total_with_delivery, from_number_clean)
             reply_message = f"Thank you! Your delivery fee is GHS {delivery_fee:.2f}. Your new total is *GHS {total_with_delivery:.2f}*.\n\nPlease use this link to pay:\n{payment_link}"
             
-            # Call centralized helper
             await _send_bot_reply_and_update_session(from_number_clean, reply_message, user_id, current_session, current_conversation_history, "location_received_and_payment_link_sent")
             handled_by_state = True
             return JSONResponse(content={}, status_code=200)
@@ -485,30 +670,25 @@ async def whatsapp_webhook(request: Request):
         unpaid_order_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", ORDER_STATUS_PENDING_PAYMENT).order("created_at", desc=True).limit(1).execute()
         if unpaid_order_res.data:
             order = unpaid_order_res.data[0]
-            # Convert incoming_msg_body to lowercase for case-insensitive matching
             lower_incoming_msg_body = incoming_msg_body.lower()
             
-            # Prioritize cancellation/negation
             if "cancel" in lower_incoming_msg_body or "no" in lower_incoming_msg_body:
                 supabase.table("orders").update({"status": ORDER_STATUS_CANCELLED}).eq("id", order['id']).execute()
-                # Also expire the session associated with this cancelled order
                 if current_session:
                     try:
                         supabase.table("sessions").update({"expires_at": datetime.now(timezone.utc).isoformat(), "last_intent": "order_cancelled", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", current_session['id']).execute()
                         logger.debug(f"Session {current_session['id']} explicitly expired due to order cancellation.")
                     except Exception as e:
                         logger.error(f"Error expiring session {current_session['id']} after order cancellation: {e}", exc_info=True)
-                reply_message = f"Your order ({order.get('order_number')}) has been cancelled. Feel free to start a new one anytime!"
-            # Check for payment confirmation, ensuring no explicit negation is present
+                reply_message = random.choice(ORDER_CANCELLED_CONFIRMATIONS).format(order_number=order.get('order_number'))
             elif any(keyword in lower_incoming_msg_body for keyword in ["pay", "yes", "payment"]) and \
-                 not any(negation in lower_incoming_msg_body for negation in ["not", "don't", "dont"]):
+                 not any(negation in lower_incoming_msg_body for negation in negation_keywords):
                 total = order.get('total_with_delivery') or order.get('total_amount', 0)
                 payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], total, from_number_clean)
-                reply_message = f"Of course. Please use the link below to complete your payment for order {order.get('order_number')}:\n\n{payment_link}"
+                reply_message = random.choice(PAYMENT_LINK_REMINDERS).format(order_number=order.get('order_number'), payment_link=payment_link)
             else:
-                reply_message = f"You have a pending order ({order.get('order_number')}) awaiting payment. Would you like to *pay* now or *cancel* the order?"
+                reply_message = random.choice(PENDING_PAYMENT_PROMPTS).format(order_number=order.get('order_number'))
             
-            # Call centralized helper
             await _send_bot_reply_and_update_session(from_number_clean, reply_message, user_id, current_session, current_conversation_history, "payment_prompt")
             handled_by_state = True
             return JSONResponse(content={}, status_code=200)
@@ -533,22 +713,20 @@ async def whatsapp_webhook(request: Request):
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 }
 
-                # If an existing session record for this user_id is found (active or expired), UPDATE it.
-                # Otherwise, INSERT a new one.
-                if existing_session_record: # Check if *any* record for user_id exists
+                if existing_session_record:
                     logger.debug(f"User {user_id} starting new order. Updating existing session record for user_id.")
                     update_res = supabase.table("sessions").update(session_payload_data).eq("user_id", user_id).execute()
                     if update_res.data:
-                        current_session = update_res.data[0] # Update current_session to the newly updated one
+                        current_session = update_res.data[0]
                         logger.debug(f"Existing session record for user {user_id} updated with new order session details.")
                     else:
                         logger.error(f"Failed to update existing session record for user {user_id} on start_order intent. Supabase response: {update_res.error}")
                         reply_message = "Sorry, I'm having trouble starting a new order right now. Please try again in a moment."
-                        current_session = None # Ensure it's None if update failed
-                else: # No session record exists for this user_id, INSERT a new one
+                        current_session = None
+                else:
                     logger.debug(f"No session record found for user {user_id}. Creating first session for start_order intent.")
-                    session_payload_data["user_id"] = user_id # Add user_id for insert
-                    session_payload_data["created_at"] = datetime.now(timezone.utc).isoformat() # Add created_at for insert
+                    session_payload_data["user_id"] = user_id
+                    session_payload_data["created_at"] = datetime.now(timezone.utc).isoformat()
                     insert_res = supabase.table("sessions").insert(session_payload_data).execute()
                     if insert_res.data:
                         current_session = insert_res.data[0]
@@ -556,17 +734,17 @@ async def whatsapp_webhook(request: Request):
                     else:
                         logger.error(f"Failed to create new session for user {user_id} on start_order intent. Supabase response: {insert_res.error}")
                         reply_message = "Sorry, I'm having trouble starting a new order right now. Please try again in a moment."
-                        current_session = None # Ensure it's None if insert failed
+                        current_session = None
 
-                if current_session: # Ensure current_session exists before building menu_url
+                if current_session:
                     menu_url = f"{settings.FRONTEND_URL}?session={current_session['session_token']}"
-                    reply_message = f"Great! Please use the link below to browse our menu and add items to your cart. Return to this chat after you confirm your items on the website!\n\n{menu_url}"
+                    reply_message = random.choice(MENU_LINK_REMINDERS).format(menu_url=menu_url)
                 else:
                     reply_message = "Sorry, I couldn't start your order. Please try again."
 
             elif intent == 'check_status':
                 paid_order_res = supabase.table("orders").select("status, order_number").eq("user_id", user_id).eq("payment_status", "paid").order("created_at", desc=True).limit(1).execute()
-                reply_message = f"Your most recent order ({paid_order_res.data[0]['order_number']}) is currently '{paid_order_res.data[0]['status']}'." if paid_order_res.data else "It looks like you don't have any active orders with us. To start one, just say 'menu'."
+                reply_message = f"Your most recent order ({paid_order_res.data[0]['order_number']}) is currently '{paid_order_res.data[0]['status']}'." if paid_order_res.data else random.choice(CART_EMPTY_RESPONSES)
             
             elif intent == 'show_cart':
                 pending_order_res = supabase.table("orders").select("items_json, total_amount, status").eq("user_id", user_id).in_("status", [ORDER_STATUS_PENDING_CONFIRMATION, ORDER_STATUS_AWAITING_LOCATION, ORDER_STATUS_PENDING_PAYMENT]).order("created_at", desc=True).limit(1).execute()
@@ -587,7 +765,6 @@ async def whatsapp_webhook(request: Request):
                         cart_summary_items.append(f'- {product_name} x {quantity} (GHS {item_total:.2f})')
 
                     reply_message = f"🛒 *Your Current Cart:*\n" + "\n".join(cart_summary_items) + f"\n\n*Total: GHS {total_amount:.2f}*\n\n"
-                    # Add current state reminder to cart summary
                     if order.get("status") == ORDER_STATUS_PENDING_CONFIRMATION:
                         reply_message += "Please select *delivery* or *pickup* to proceed with your order."
                     elif order.get("status") == ORDER_STATUS_AWAITING_LOCATION:
@@ -595,41 +772,41 @@ async def whatsapp_webhook(request: Request):
                     elif order.get("status") == ORDER_STATUS_PENDING_PAYMENT:
                         reply_message += "Your order is awaiting payment. Please complete the payment to finalize."
                 else:
-                    reply_message = "Your cart is currently empty. To start an order, just say 'menu'."
+                    reply_message = random.choice(CART_EMPTY_RESPONSES)
 
             elif intent == 'polite_acknowledgement':
-                ending_messages = [
-                    "Alright, have a great day! Feel free to message me anytime you need groceries.",
-                    "You're welcome!"
-                ]
-                if last_bot_message in ending_messages:
-                    reply_message = "You're welcome!"
+                if last_bot_message and any(msg in last_bot_message for msg in END_CONVERSATION_RESPONSES):
+                    reply_message = random.choice(POLITE_ACKNOWLEDGEMENT_RESPONSES_ENDING)
                 else:
-                    reply_message = "You're welcome! Is there anything else I can help with?"
+                    reply_message = random.choice(POLITE_ACKNOWLEDGEMENT_RESPONSES_GENERAL)
 
             elif intent == 'end_conversation':
-                reply_message = "Alright, have a great day! Feel free to message me anytime you need groceries."
+                reply_message = random.choice(END_CONVERSATION_RESPONSES)
             
-            elif intent == 'busy': # Handle specific AI intent for rate limits/busy
-                reply_message = "I'm a bit busy at the moment, please try again in a few minutes."
+            elif intent == 'help': # New: Handle 'help' intent
+                reply_message = random.choice(HELP_RESPONSES)
 
-            elif intent == 'error_ai': # Handle specific AI intent for AI errors
-                reply_message = "I seem to be having trouble understanding right now. Could you please rephrase, or type 'menu' to start an order?"
+            elif intent == 'busy':
+                reply_message = random.choice(AI_BUSY_RESPONSES)
+
+            elif intent == 'error_ai':
+                reply_message = random.choice(AI_ERROR_RESPONSES)
             
-            else: # greet or fallback
+            elif intent == 'unknown_input': # New: Handle unknown input
+                reply_message = random.choice(UNKNOWN_INPUT_RESPONSES)
+            
+            else: # Fallback to greet if none of the above, should rarely hit now
                 if is_new_user:
-                    reply_message = "Hello and welcome to Fresh Market GH! 🌿 I'm your personal assistant for ordering fresh groceries. You can say 'menu' to start shopping, or 'status' to check an order."
+                    reply_message = get_time_of_day_greeting()
                 else:
-                    reply_message = "Welcome back! How can I help with your groceries today? (You can say 'menu' or 'status')"
+                    reply_message = random.choice(GREETING_RETURNING_USER_RESPONSES)
         
-            # Call centralized helper for intent-based replies
             await _send_bot_reply_and_update_session(from_number_clean, reply_message, user_id, current_session, current_conversation_history, intent)
         
         return JSONResponse(content={}, status_code=200)
 
     except Exception as e:
-        logger.error(f"Critical webhook error for {from_number_clean}: {e}", exc_info=True)
-        # Use the new centralized error function
+        logger.error(f"Unhandled critical webhook error for {from_number_clean}: {e}", exc_info=True)
         await send_user_error_message(from_number_clean, user_id, "I'm sorry, an unexpected error occurred. Please try again.")
         return JSONResponse(content={}, status_code=200)
 
@@ -642,8 +819,6 @@ async def confirm_items(request: OrderRequest):
     if not session_res.data: raise HTTPException(404, "Session invalid")
     user_id, phone_number = session_res.data[0]['user_id'], session_res.data[0]['phone_number']
 
-    # Mark the session as expired/inactive instead of deleting it, to retain conversation history.
-    # Set expires_at to now, and update last_intent for admin view.
     supabase.table("sessions").update({"expires_at": datetime.now(timezone.utc).isoformat(), "last_intent": "order_confirmed_web", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("session_token", request.session_token).execute()
     logger.debug(f"Session {request.session_token} marked as expired (order_confirmed_web).")
 
@@ -664,29 +839,12 @@ async def confirm_items(request: OrderRequest):
     reply = (f"Thank you for confirming your items!\n\n*Your Order:*\n" + "\n".join(ordered_items_list) +
              f"\n\nSubtotal: *GHS {request.total_amount:.2f}*\n\nTo proceed, would you like *delivery* or will you *pickup* the order yourself?")
     
-    # Use the centralized _send_bot_reply_and_update_session helper here
-    # Since this is initiated from the web, there might not be a 'current_session' from webhook logic
-    # but the helper will ensure a history session is created/updated for this interaction.
-    # We pass None for current_session, and the function will handle creating a new one if needed.
-    # We also pass the user's phone number and the reply as a "bot" message.
-    # We also explicitly create a user message entry for the 'confirm-items' trigger
-    # since this endpoint is external to the main whatsapp_webhook.
-    # First, append the "user" action that led to this endpoint call.
-    # Then, let _send_bot_reply_and_update_session handle the bot's reply.
-
-    # Simulate the user's action that led to /confirm-items
-    # This is a conceptual entry, as the actual user message came from the web, not WhatsApp.
-    # It helps to keep the conversation history coherent.
     user_action_entry = {
         "speaker": "user",
         "message": f"Confirmed items on website (session: {request.session_token})",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "type": "web_action"
     }
-    # Create a fresh history for this interaction, starting with the simulated user action
-    # This ensures that the conversation history for this specific web-initiated flow
-    # is tracked correctly, separate from any ongoing WhatsApp conversation session.
-    # The _send_bot_reply_and_update_session will then create a new session if needed.
     web_initiated_history = [user_action_entry]
 
     await _send_bot_reply_and_update_session(phone_number, reply, user_id, current_session=None, current_conversation_history=web_initiated_history, intent="order_confirmation_prompt")
@@ -709,7 +867,6 @@ async def paystack_webhook(request: Request):
         logger.warning("Paystack webhook received without signature.")
         raise HTTPException(status_code=400, detail="Missing X-Paystack-Signature header.")
 
-    # Verify webhook signature
     import hmac
     import hashlib
     try:
@@ -736,12 +893,9 @@ async def paystack_webhook(request: Request):
         logger.info(f"Paystack charge.success event received for reference: {reference}, status: {status}, amount: {amount/100:.2f} {currency}")
 
         if status == "success":
-            # Extract order_id from metadata or reference
             order_id = data.get("metadata", {}).get("order_id")
             if not order_id and reference:
-                # Attempt to parse order_id from reference if it was constructed as "ORD-timestamp_unique"
                 try:
-                    # Assuming reference format is order_id_timestamp
                     order_id = reference.split('_')[0]
                 except IndexError:
                     logger.warning(f"Could not parse order_id from reference: {reference}")
@@ -750,8 +904,6 @@ async def paystack_webhook(request: Request):
                 logger.error(f"Paystack webhook: Could not determine order_id for successful transaction reference: {reference}. Event data: {event}")
                 return JSONResponse(content={"message": "Order ID not found in webhook data."}, status_code=400)
 
-            # Verify the transaction with Paystack (optional but recommended for critical updates)
-            # This step adds an extra layer of security.
             verification_url = f"https://api.paystack.co/transaction/verify/{reference}"
             headers = {"Authorization": f"Bearer {settings.PAYSTACK_SECRET_KEY}"}
             try:
@@ -762,12 +914,10 @@ async def paystack_webhook(request: Request):
                     
                     if verify_data.get("status") is True and verify_data.get("data", {}).get("status") == "success":
                         logger.info(f"Paystack transaction {reference} verified successfully.")
-                        # Update order status in Supabase
                         try:
                             order_update_res = supabase.table("orders").update({"payment_status": "paid", "status": ORDER_STATUS_PROCESSING, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", order_id).execute()
                             if order_update_res.data:
                                 logger.info(f"Order {order_id} status updated to 'processing' (paid) after Paystack webhook.")
-                                # Get user phone to send confirmation
                                 user_res = supabase.table("users").select("phone_number").eq("id", order_update_res.data[0]['user_id']).single().execute()
                                 if user_res.data:
                                     phone_number = user_res.data['phone_number']
@@ -777,21 +927,15 @@ async def paystack_webhook(request: Request):
                                     logger.error(f"Could not find user phone for order {order_id} to send payment confirmation.")
                             else:
                                 logger.error(f"Failed to update order {order_id} in Supabase after successful Paystack webhook: {order_update_res.error}")
-                                # Even if Supabase update fails, return 200 to Paystack to avoid retries
                         except Exception as db_e:
                             logger.error(f"Database error updating order {order_id} after Paystack webhook: {db_e}", exc_info=True)
                     else:
                         logger.warning(f"Paystack transaction {reference} verification failed. Verify data: {verify_data}")
-                        # Optionally, handle failed verification (e.g., mark order as payment_failed, alert admin)
             except httpx.RequestError as verify_e:
                 logger.error(f"Error verifying Paystack transaction {reference}: {verify_e}", exc_info=True)
-                # Still return 200 to Paystack to acknowledge receipt, but log internal error
             except json.JSONDecodeError as json_e:
                 logger.error(f"JSON decode error from Paystack verification for reference {reference}: {json_e}", exc_info=True)
-                # Still return 200 to Paystack to acknowledge receipt, but log internal error
         else:
             logger.info(f"Paystack webhook received charge.success with status '{status}' for reference {reference}. No order update performed.")
     
-    # Always return 200 OK to Paystack to acknowledge receipt of the webhook.
-    # Otherwise, Paystack will keep retrying the webhook.
     return JSONResponse(content={"message": "Webhook received"}, status_code=200)
