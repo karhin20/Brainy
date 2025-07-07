@@ -485,11 +485,11 @@ async def whatsapp_webhook(request: Request):
         unpaid_order_res = supabase.table("orders").select("*").eq("user_id", user_id).eq("status", ORDER_STATUS_PENDING_PAYMENT).order("created_at", desc=True).limit(1).execute()
         if unpaid_order_res.data:
             order = unpaid_order_res.data[0]
-            if incoming_msg_body in ["pay", "yes", "payment"]:
-                total = order.get('total_with_delivery') or order.get('total_amount', 0)
-                payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], total, from_number_clean)
-                reply_message = f"Of course. Please use the link below to complete your payment for order {order.get('order_number')}:\n\n{payment_link}"
-            elif incoming_msg_body in ["cancel", "no"]:
+            # Convert incoming_msg_body to lowercase for case-insensitive matching
+            lower_incoming_msg_body = incoming_msg_body.lower()
+            
+            # Prioritize cancellation/negation
+            if "cancel" in lower_incoming_msg_body or "no" in lower_incoming_msg_body:
                 supabase.table("orders").update({"status": ORDER_STATUS_CANCELLED}).eq("id", order['id']).execute()
                 # Also expire the session associated with this cancelled order
                 if current_session:
@@ -499,6 +499,12 @@ async def whatsapp_webhook(request: Request):
                     except Exception as e:
                         logger.error(f"Error expiring session {current_session['id']} after order cancellation: {e}", exc_info=True)
                 reply_message = f"Your order ({order.get('order_number')}) has been cancelled. Feel free to start a new one anytime!"
+            # Check for payment confirmation, ensuring no explicit negation is present
+            elif any(keyword in lower_incoming_msg_body for keyword in ["pay", "yes", "payment"]) and \
+                 not any(negation in lower_incoming_msg_body for negation in ["not", "don't", "dont"]):
+                total = order.get('total_with_delivery') or order.get('total_amount', 0)
+                payment_link = await generate_paystack_payment_link(order['id'], order['order_number'], total, from_number_clean)
+                reply_message = f"Of course. Please use the link below to complete your payment for order {order.get('order_number')}:\n\n{payment_link}"
             else:
                 reply_message = f"You have a pending order ({order.get('order_number')}) awaiting payment. Would you like to *pay* now or *cancel* the order?"
             
